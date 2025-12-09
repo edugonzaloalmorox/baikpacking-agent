@@ -1,0 +1,105 @@
+# -------------------------
+# Python
+# -------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Byte-compiled / optimized / DLL files
+*.pyc
+*.pyd
+*.pyo
+*.pdc
+
+# -------------------------
+# Jupyter / notebooks
+# -------------------------
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# -------------------------
+# Environment & secrets
+# -------------------------
+.env
+.env.*
+!.env.example
+
+# -------------------------
+# Logs / monitoring / artifacts
+# -------------------------
+logs/
+*.log
+artefacts/
+artifacts/
+runs/
+mlruns/
+
+# If storing evaluation JSONs locally:
+eval_results/
+monitoring/
+
+# -------------------------
+# Data
+# -------------------------
+data/raw/
+data/tmp/
+data/cache/
+*.sqlite3
+*.db
+qdrant_storage/
+
+# -------------------------
+# Project-specific
+# -------------------------
+
+# Qdrant local storage (if using local Qdrant instance)
+qdrant_data/
+
+# DotWatcher scraping outputs
+dotwatcher_bikes_raw.json
+dotwatcher_bikes_raw.jsonl
+dotwatcher_bikes_cleaned.json
+
+# JSON cache from scrapers
+cache/
+.tmp/
+
+# -------------------------
+# Editors / IDEs
+# -------------------------
+.vscode/
+.idea/
+*.iml
+
+# -------------------------
+# OS generated files
+# -------------------------
+.DS_Store
+Thumbs.db
+
+# -------------------------
+# Docker
+# -------------------------
+docker-data/
+*.pid
+
+# -------------------------
+# Coverage
+# -------------------------
+.coverage
+coverage.xml
+htmlcov/
+.cache/
+pytest_cache/
