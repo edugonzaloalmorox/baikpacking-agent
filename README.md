@@ -1,20 +1,20 @@
-🚴‍♂️ bAIpacking Agent
+# 🚴‍♂️ bAIpacking Agent
 
 An AI agent for exploring bikepacking setups using structured data, retrieval, and multi-tool reasoning
 
-📌 Overview
+## 📌 Overview
 
 This project develops an LLM-powered agent capable of answering questions about bikepacking race setups (bikes, gear, riders, events). The agent uses a curated knowledge base extracted from DotWatcher.cc (“Bikes of…” articles), stored in a Postgres database as well as vector embeddings in Qdrant, and enhanced with tools for search, similarity queries, structured reasoning, and evaluation.
 
 
-🎯 Problem Description
+## 🎯 Problem Description
 
 Bikepacking racers share detailed equipment lists online. This information is spread across dozens of DotWatcher articles and cannot be queried efficiently.
 
-The problem:
+### The problem:
 👉 Cyclists cannot easily explore setups from previous riders to decide what bike, components, bags, or electronics to use for an upcoming race.
 
-The bAIpacking Agent solves this by:
+**The bAIpacking Agent solves this by**:
 
 - Scraping and cleaning “Bikes of…” articles
 
@@ -23,6 +23,7 @@ The bAIpacking Agent solves this by:
 - Storing riders in Postgres + embedding them in Qdrant
 
 - Providing an LLM agent with multiple tools for:
+
 
 - DB search (SQL)
 
