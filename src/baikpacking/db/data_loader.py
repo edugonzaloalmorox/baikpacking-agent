@@ -5,6 +5,7 @@ from typing import Any, Dict, List
 
 import psycopg2
 from psycopg2.extras import Json
+from db_connection import DB_DSN
 
 
 # ---------------------------------------------------------------------------
@@ -14,9 +15,8 @@ from psycopg2.extras import Json
 
 DATA_PATH = Path("data/dotwatcher_bikes_cleaned.json")
 
-# Database connection string.
-DB_DSN = os.getenv("DOTWATCHER_DB_DSN", "postgresql://localhost:5432/dotwatcher")
-
+# Database connection string
+DB_DSN=DB_DSN
 
 # ---------------------------------------------------------------------------
 # SQL definitions
