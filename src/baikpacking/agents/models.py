@@ -1,27 +1,23 @@
+from collections import Counter
 from typing import List, Optional
-from pydantic import BaseModel, Field
+
+from pydantic import BaseModel, Field, model_validator
 
 
 class ChunkInfo(BaseModel):
-    """
-    Represents a single matched text chunk for a rider.
-    """
-
     score: float
     text: str
     chunk_index: Optional[int] = None
 
 
 class SimilarRider(BaseModel):
-    """
-    A rider used as inspiration for the recommendation.
-    """
-
     rider_id: int
+    article_id: Optional[int] = None  # if you want event_web_search by DB id
 
-    name: Optional[str] = None
+    name: str
     event_title: Optional[str] = None
     event_url: Optional[str] = None
+    event_key: Optional[str] = None  # helpful for strict event grounding
 
     frame_type: Optional[str] = None
     frame_material: Optional[str] = None
@@ -35,31 +31,69 @@ class SimilarRider(BaseModel):
     chunks: List[ChunkInfo] = Field(default_factory=list)
 
 
-class SetupRecommendation(BaseModel):
-    """
-    Final output of the recommender agent.
-
-    - event: target event (e.g. "Transcontinental No10")
-    - bike_type: headline bike description
-    - wheels / tyres / drivetrain: key drivetrain choices
-    - bags: luggage system (frame / seat / bar / top tube / stem bags)
-    - sleep_system: sleeping gear (mat, bag, bivvy, etc.)
-    - summary: short, user-facing summary
-    - reasoning: explanation grounded in similar riders
-    - similar_riders: list of riders that inspired this setup
-    """
-
-    event: Optional[str] = None
-
+class SetupCore(BaseModel):
     bike_type: Optional[str] = None
     wheels: Optional[str] = None
     tyres: Optional[str] = None
     drivetrain: Optional[str] = None
-
     bags: Optional[str] = None
     sleep_system: Optional[str] = None
 
+
+class SetupRecommendation(BaseModel):
+    event: Optional[str] = None
     summary: str
     reasoning: Optional[str] = None
 
+    recommended_setup: SetupCore = Field(default_factory=SetupCore)
     similar_riders: List[SimilarRider] = Field(default_factory=list)
+
+    # -----------------
+    # Convenience accessors (for CLI / UI)
+    # -----------------
+    @property
+    def bike_type(self) -> Optional[str]:
+        return self.recommended_setup.bike_type
+
+    @property
+    def wheels(self) -> Optional[str]:
+        return self.recommended_setup.wheels
+
+    @property
+    def tyres(self) -> Optional[str]:
+        return self.recommended_setup.tyres
+
+    @property
+    def drivetrain(self) -> Optional[str]:
+        return self.recommended_setup.drivetrain
+
+    @property
+    def bags(self) -> Optional[str]:
+        return self.recommended_setup.bags
+
+    @property
+    def sleep_system(self) -> Optional[str]:
+        return self.recommended_setup.sleep_system
+
+    # -----------------
+    # Validators
+    # -----------------
+    @model_validator(mode="after")
+    def _validate_grounding_and_event(self):
+        if not self.similar_riders:
+            raise ValueError("similar_riders must be non-empty for grounding.")
+
+        if not self.event:
+            titles = [r.event_title for r in self.similar_riders if r.event_title]
+            if titles:
+                self.event = Counter(titles).most_common(1)[0][0]
+            else:
+                raise ValueError("event is required (could not infer from similar_riders).")
+        return self
+
+    @model_validator(mode="after")
+    def _no_empty_setup(self):
+        s = self.recommended_setup
+        if not any([s.bike_type, s.wheels, s.tyres, s.drivetrain, s.bags, s.sleep_system]):
+            raise ValueError("recommended_setup is empty; fallback logic failed")
+        return self
