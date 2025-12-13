@@ -1,20 +1,26 @@
-from baikpacking.agents.recommender_agent import recommend_setup
+import pytest
+from baikpacking.agents.recommender_agent import (
+    recommender_agent,
+    _postprocess_recommendation,
+)
 
-if __name__ == "__main__":
-    query = "I'm doing Gran Guanche, prefer comfort over aero. Give me recommendations."
-    rec = recommend_setup(query)
 
-    print("SUMMARY:")
-    print(rec.summary)
+@pytest.mark.asyncio
+async def test_recommender_basic():
+    query = "I'm doing GranGuanche Audax Trail 2025, prefer 45mm tyres."
+    result = await recommender_agent.run(query)
+    rec = _postprocess_recommendation(result.output)
 
-    print("\nBIKE TYPE:", rec.bike_type)
-    print("WHEELS:", rec.wheels)
-    print("TYRES:", rec.tyres)
-    print("DRIVETRAIN:", rec.drivetrain)
+    # Basic sanity check on the main output
+    assert isinstance(rec.summary, str)
+    assert len(rec.summary) > 20
+    assert isinstance(rec.event, str)
+    assert "Gran" in rec.event or "Guanche" in rec.event
 
-    print("\nBAGS:", rec.bags)
-    print("SLEEP SYSTEM:", rec.sleep_system)
+    # Similar riders: don't fail the test if empty, just assert the type
+    assert isinstance(rec.similar_riders, list)
 
-    print("\nSIMILAR RIDERS:")
-    for r in rec.similar_riders:
-        print(f"- {r.name} @ {r.event_title} (year={r.year}, score={r.best_score:.4f})")
+    # Optional: if you want visibility during development
+    if not rec.similar_riders:
+        # This will show in `-s` mode
+        print("WARNING: similar_riders is empty in this run")
