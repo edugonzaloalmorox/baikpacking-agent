@@ -1,25 +1,30 @@
 import json
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from baikpacking.eval.datasets import load_queries
 from baikpacking.embedding.config import Settings
 from baikpacking.embedding.qdrant_utils import get_qdrant_client
 from baikpacking.embedding.embed import embed_texts
 from baikpacking.eval.retrievers_qdrant import DenseQdrantRetriever
+from baikpacking.eval.retrievers import RetrievedHit
+
+from baikpacking.eval.reranker import RerankerConfig, rerank_hits
+
+
+def load_rerank_config(path: str) -> RerankerConfig:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return RerankerConfig(**data)
 
 
 def payload_summary(payload: Dict[str, Any]) -> str:
     """
     Build a readable one-liner for labeling.
-
-    Prefer payload['text'] because in your collection it often contains a compact rider line
-    including bike/tyres/bags/navigation. Fallback to stitched structured fields.
     """
     txt = (payload.get("text") or "").strip()
     if txt:
-        return txt 
+        return txt
 
     parts = []
     for k in [
@@ -44,7 +49,6 @@ def overlap_diagnostics(all_rankings: List[List[int]], top_k: int = 20) -> Dict[
     if not all_rankings:
         return {"n_queries": 0}
 
-    # frequency of each rider_id in top-k across queries
     freq = Counter()
     for r in all_rankings:
         for rid in r[:top_k]:
@@ -52,7 +56,7 @@ def overlap_diagnostics(all_rankings: List[List[int]], top_k: int = 20) -> Dict[
 
     n_queries = len(all_rankings)
     most_common = freq.most_common(10)
-    # average pairwise Jaccard overlap (approx with first 30 queries to keep it cheap)
+
     sample = all_rankings[: min(30, n_queries)]
     jaccs = []
     for i in range(len(sample)):
@@ -71,11 +75,26 @@ def overlap_diagnostics(all_rankings: List[List[int]], top_k: int = 20) -> Dict[
     }
 
 
+def dedupe_by_doc_id_keep_best(hits: List[RetrievedHit]) -> List[RetrievedHit]:
+    """
+    Deduplicate by doc_id (rider_id). Keep the hit with the best dense score.
+    """
+    best: Dict[int, RetrievedHit] = {}
+    for h in hits:
+        did = int(h.doc_id)
+        prev = best.get(did)
+        if prev is None or float(h.score) > float(prev.score):
+            best[did] = h
+    return list(best.values())
+
+
 def main(
     queries_path: str = "data/eval/queries.jsonl",
     out_path: str = "data/eval/candidates.jsonl",
     candidate_k: int = 50,
     write_diag: bool = True,
+    rerank: bool = True,
+    rerank_config_path: str = "data/eval/rerank_config.json",
 ) -> None:
     settings = Settings()
     client = get_qdrant_client()
@@ -85,6 +104,10 @@ def main(
         collection_name=settings.qdrant_collection,
         embed_fn=embed_texts,
     )
+
+    cfg: Optional[RerankerConfig] = None
+    if rerank:
+        cfg = load_rerank_config(rerank_config_path)
 
     queries = load_queries(queries_path)
     out = Path(out_path)
@@ -96,20 +119,36 @@ def main(
         for q in queries:
             qid = q["qid"]
             text = q["query"]
-            hits = retriever.search(text, k=candidate_k)
 
-            ranking = [int(h.doc_id) for h in hits]
+           
+            retrieve_k = candidate_k
+            if cfg is not None:
+                retrieve_k = max(candidate_k, candidate_k * int(cfg.oversample))
+
+            raw_hits = retriever.search(text, k=retrieve_k)
+
+
+            deduped = dedupe_by_doc_id_keep_best(raw_hits)
+
+        
+            final_hits = deduped
+            if cfg is not None:
+                final_hits = rerank_hits(text, deduped, cfg)
+
+
+            final_hits = final_hits[:candidate_k]
+
+            ranking = [int(h.doc_id) for h in final_hits]
             all_rankings.append(ranking)
 
             candidates = []
-            for h in hits:
+            for h in final_hits:
                 payload = getattr(h, "payload", None) or {}
                 candidates.append(
                     {
                         "rider_id": int(h.doc_id),
-                        "point_id": h.point_id,
+                        "point_id": int(h.point_id),
                         "score": float(h.score),
-                        # payload bits for labeling & traceability
                         "name": payload.get("name"),
                         "event_title": payload.get("event_title"),
                         "event_url": payload.get("event_url"),
@@ -128,7 +167,10 @@ def main(
                 "qid": qid,
                 "query": text,
                 "candidate_k": candidate_k,
-                "retriever": "dense_qdrant",
+                "retriever": retriever.name,
+                "reranked": bool(cfg is not None),
+                "rerank_config_path": rerank_config_path if cfg is not None else None,
+                "retrieve_k": int(retrieve_k),
                 "candidates": candidates,
             }
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
