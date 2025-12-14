@@ -45,7 +45,7 @@ def _postprocess_recommendation(rec: SetupRecommendation) -> SetupRecommendation
 
     # Sort: same event first (if event string exists), then year desc, then score desc
     rec.similar_riders.sort(
-        key=lambda r: ((rec.event or "").lower() in (r.event_title or "").lower(), r.year or 0, r.best_score or 0),
+        key=lambda r: ((rec.event or "").lower() in (r.event_title or "").lower(), r.best_score or 0, r.year or 0),
         reverse=True,
     )
     return rec
