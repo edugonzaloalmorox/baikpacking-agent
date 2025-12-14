@@ -51,9 +51,11 @@ def search_similar_riders(
 
     raw = search_riders_grouped(
         query=query,
-        top_k_riders=top_k_riders * 2,
-        oversample_factor=5,
+        top_k_riders=top_k_riders,
+        oversample_factor=10,
         max_chunks_per_rider=3,
+        apply_rerank=True,
+       rerank_config=None
     )
 
     logger.info("search_riders_grouped returned %d raw riders", len(raw))
