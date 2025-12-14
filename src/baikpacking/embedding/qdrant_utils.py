@@ -11,6 +11,12 @@ from .config import Settings
 from .embed import embed_texts
 from baikpacking.tools.events import EVENT_ALIASES
 
+try:
+    from baikpacking.retrieval.rank import RerankerConfig, rerank_hits
+except Exception:
+    RerankerConfig = None 
+    rerank_hits = None  
+
 logger = logging.getLogger(__name__)
 settings = Settings()
 
@@ -267,6 +273,15 @@ def group_hits_by_rider(
 
         if score > agg["best_score"]:
             agg["best_score"] = score
+            agg["name"] = payload.get("name")
+            agg["event_title"] = payload.get("event_title")
+            agg["event_url"] = payload.get("event_url")
+            agg["frame_type"] = payload.get("frame_type")
+            agg["frame_material"] = payload.get("frame_material")
+            agg["wheel_size"] = payload.get("wheel_size")
+            agg["tyre_width"] = payload.get("tyre_width")
+            agg["electronic_shifting"] = payload.get("electronic_shifting")
+            agg["event_key"] = payload.get("event_key")
 
         agg["chunks"].append(
             {
@@ -331,12 +346,52 @@ def detect_event_key(text: str) -> Optional[str]:
 # High-level grouped search (used by the recommender agent)
 # ---------------------------------------------------------------------------
 
+class _RerankHit:
+    """Minimal adapter for rerank_hits(): doc_id/score/payload."""
+    def __init__(self, doc_id: int, score: float, payload: Dict[str, Any]):
+        self.doc_id = doc_id
+        self.score = score
+        self.payload = payload
+
+
+def _rerank_grouped_riders(
+    query: str,
+    riders: List[Dict[str, Any]],
+    cfg: "RerankerConfig",
+) -> List[Dict[str, Any]]:
+    # Build one hit per rider using best_score + best chunk text as payload["text"]
+    hits: List[_RerankHit] = []
+    by_id: Dict[int, Dict[str, Any]] = {}
+
+    for r in riders:
+        rid = int(r["rider_id"])
+        by_id[rid] = r
+
+        chunks = r.get("chunks") or []
+        best_text = (chunks[0].get("text") if chunks else "") or ""
+
+        payload = {
+            "text": best_text,  # reranker expects payload["text"]
+            "event_key": r.get("event_key"),
+            "frame_type": r.get("frame_type"),
+            "tyre_width": r.get("tyre_width"),
+            "electronic_shifting": r.get("electronic_shifting"),
+        }
+        hits.append(_RerankHit(doc_id=rid, score=float(r.get("best_score") or 0.0), payload=payload))
+
+    ranked_hits = rerank_hits(query, hits, cfg)  # type: ignore[misc]
+    return [by_id[int(h.doc_id)] for h in ranked_hits if int(h.doc_id) in by_id]
+
+
 
 def search_riders_grouped(
     query: str,
     top_k_riders: int = 10,
     oversample_factor: int = 10,
     max_chunks_per_rider: int = 3,
+    *,
+    apply_rerank: bool = True,
+    rerank_config: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     High-level helper:
@@ -360,4 +415,10 @@ def search_riders_grouped(
         top_k_riders=limit,
         max_chunks_per_rider=max_chunks_per_rider,
     )
+    
+    if apply_rerank and rerank_hits is not None and RerankerConfig is not None:
+        cfg = RerankerConfig(**(rerank_config or {}))
+        riders = _rerank_grouped_riders(query, riders, cfg)
+
     return riders[:top_k_riders]
+ 
