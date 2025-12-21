@@ -3,14 +3,14 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from baikpacking.eval.datasets import load_queries
+from baikpacking.eval.retrieval.datasets import load_queries
 from baikpacking.embedding.config import Settings
 from baikpacking.embedding.qdrant_utils import get_qdrant_client
 from baikpacking.embedding.embed import embed_texts
-from baikpacking.eval.retrievers_qdrant import DenseQdrantRetriever
-from baikpacking.eval.retrievers import RetrievedHit
+from baikpacking.eval.retrieval.retrievers_qdrant import DenseQdrantRetriever
+from baikpacking.eval.retrieval.retrievers import RetrievedHit
 
-from baikpacking.eval.reranker import RerankerConfig, rerank_hits
+from baikpacking.eval.retrieval.reranker import RerankerConfig, rerank_hits
 
 
 def load_rerank_config(path: str) -> RerankerConfig:

@@ -1,6 +1,6 @@
 from typing import List
 
-from baikpacking.eval.retrievers import RetrievedHit, BaseRetriever
+from baikpacking.eval.retrieval.retrievers import RetrievedHit, BaseRetriever
 
 
 class DenseQdrantRetriever(BaseRetriever):
