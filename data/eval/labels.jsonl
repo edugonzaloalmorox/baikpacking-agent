@@ -1,0 +1,48 @@
+
+{"qid":"q0001","relevants":[
+    {"rider_id":9900365842636515444,"rel":3,"why":"Mechanical 1x with wide-range 11–46 gearing fits steep climbs; practical endurance/gravel setup relevant to tyres/gearing/bags."},
+    {"rider_id":5610710035159200232,"rel":1,"why":"Road-oriented setup with 30–34mm tyres and bag mention; useful for bag ideas but gearing/tyres not fully aligned with constraints."}]}
+{"qid":"q0002","relevants":[
+  {"rider_id":16976417767098962956,"rel":3,"why":"Gravel setup with wide-range gearing (46/30 + 11–40) and durable tyres; well suited for wet, muddy conditions and steep climbs with a relatively lean race-oriented kit."},
+  {"rider_id":8769549251973094518,"rel":2,"why":"Reliability-focused endurance race setup with SON dynamo and Garmin charging strategy; strong reference for rain, mud, and long-distance racing."},
+  {"rider_id":6683070389355647876,"rel":2,"why":"Explicitly riding TCR with a durability-first, stripped-back setup; relevant real-world example despite heavier touring-oriented bike."},
+  {"rider_id":7901608475058754060,"rel":1,"why":"Good Garmin navigation and power strategy, but heavier loadout (Tailfin and extra kit) makes it less aligned with fast-and-light constraints."}
+]}
+{"qid":"q0003","relevants":[
+  {"rider_id":16976417767098962956,"rel":3,"why":"Mechanical gravel setup with 50mm+ tyres, wide-range gearing and full bikepacking bags; excellent real-world reference for gravel vs hardtail decision in wet, muddy conditions."},
+  {"rider_id":3279150062864090408,"rel":1,"why":"Very robust, heavy full-bikepacking setup illustrating a durability-first approach, though less optimized for gravel vs hardtail comparison."}
+]}
+{"qid":"q0004","relevants":[
+  {"rider_id":3500799666416446480,"rel":3,"why":"Ideal match: 32mm tyres, 2x mechanical Ultegra, Garmin navigation with backup, comfort sleep system, and direct Transcontinental experience."},
+  {"rider_id":5889728953248512293,"rel":3,"why":"Road-based Transcontinental setup with mechanical drivetrain, 32–34mm tyres, Garmin navigation, and a comfort-oriented sleep system; very relevant real-world example."},
+  {"rider_id":10413143751611103396,"rel":2,"why":"Strong endurance road setup with 32mm tyres and 2x mechanical drivetrain; suitable for mixed tarmac/gravel, though less explicit TCR context."},
+  {"rider_id":10502941783890319744,"rel":1,"why":"Matches tyre width, gearing and comfort sleep needs, but uses electronic shifting, making it a partial rather than ideal example."}
+]}
+{"qid":"q0005","relevants":[
+  {"rider_id":8353930157309978796,"rel":3,"why":"Mechanical drivetrain with SON dynamo and USB charging, Garmin navigation, and a relatively lean bag setup; ideal match for fast mixed-terrain racing."},
+  {"rider_id":14881511118986379712,"rel":1,"why":"2x mechanical gearing reference with endurance context, but lacks explicit dynamo/USB power and minimal bag confirmation."}
+]}
+{"qid":"q0006","relevants":[
+  {"rider_id":15929950244095500441,"rel":3,"why":"GB Duro–specific setup with Garmin navigation and no sleep system, matching a power-nap-only strategy and wet mixed-terrain racing conditions."}
+]}
+{"qid":"q0007","relevants":[
+  {"rider_id":9428573743974623375,"rel":3,"why":"Mechanical 1x drivetrain with SON dynamo and USB charging, endurance all-road geometry with aerobars, and high-volume puncture-resistant tyres; excellent GB Duro–style reference."},
+  {"rider_id":7686419754276024494,"rel":1,"why":"Mechanical drivetrain with dynamo and USB charging illustrates power strategy well, but drivetrain and tyre volume are less clearly aligned with the constraints."}
+]}
+{"qid":"q0008","relevants":[
+  {"rider_id":23122073581544235,"rel":3,"why":"MTB-style setup with 50mm+ tyres designed for rough, muddy terrain; ideal hardtail/MTB reference for GB Duro conditions."},
+  {"rider_id":5256729662298266710,"rel":3,"why":"Explicit GB Duro gravel setup with wide tyres and self-sufficient power; strong gravel-side example for wet and muddy racing."},
+  {"rider_id":7239748729643569490,"rel":2,"why":"Gravel bike modified toward MTB behaviour with wide tyres and suspension stem; good hybrid comparison case."},
+  {"rider_id":12372104933855739771,"rel":1,"why":"Capable gravel setup with near-wide tyres, but less extreme than ideal GB Duro mud-focused examples."}
+]}
+
+{"qid":"q0009","relevants":[
+  {"rider_id":13985792512278493767,"rel":3,"why":"Race-optimized gravel setup with fast 50mm+ tyres, wide MTB-style gearing and robust components suited to chunky gravel and washboard conditions."},
+  {"rider_id":8353930157309978796,"rel":2,"why":"Robust, wide-gearing setup with fast XC-style tyres that balances speed and reliability, though slightly more touring-oriented."},
+  {"rider_id":5256729662298266710,"rel":1,"why":"GB Duro–specific and durable, but heavier and more comfort-focused than ideal for a pure racing setup."}
+]}
+{"qid":"q0010","relevants":[
+  {"rider_id":8353930157309978796,"rel":3,"why":"Rigid, wide-tyre setup with very wide gearing, dynamo power and Garmin navigation; ideal simple and durable reference for GB Duro conditions."},
+  {"rider_id":1006893958148799117,"rel":2,"why":"Gravel-plus rigid setup with tubeless mid-wide tyres, Garmin navigation and full bikepacking kit; workable alternative to MTB-style build."},
+  {"rider_id":15875524168037015678,"rel":1,"why":"Region- and age-matched gravel setup with Garmin navigation and mid-wide tyres, though less extreme than ideal for GB Duro mud and roughness."}
+]}

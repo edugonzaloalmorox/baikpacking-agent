@@ -1,0 +1,21 @@
+{
+  "oversample": 5,
+  "w_event_match": 0.1,
+
+  "w_mechanical_ok": 0.05,
+  "w_electronic_violation": -0.2,
+
+  "w_garmin_ok": 0.03,
+  "w_garmin_violation": -0.05,
+
+  "w_rigid_ok": 0.03,
+  "w_suspension_violation": -0.1,
+
+  "w_tyre_match": 0.1,
+  "w_tyre_mismatch": -0.1,
+
+  "w_puncture_terms": 0.03,
+  "w_wide_gearing_terms": 0.03,
+
+  "w_has_structured_fields": 0.01
+}
