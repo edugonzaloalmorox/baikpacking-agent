@@ -1,8 +1,6 @@
-from __future__ import annotations
-
 import logging
 import re
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 
 import anyio
 import httpx
@@ -10,6 +8,12 @@ from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Tool, RunContext, Agent
 from pydantic_ai.models.openai import OpenAIChatModel
+
+import hashlib
+import json
+import os
+import time
+from pathlib import Path
 
 from baikpacking.db.db_connection import get_pg_connection
 
@@ -83,6 +87,118 @@ class EventWebContext(BaseModel):
     results: List[EventSearchResult] = Field(default_factory=list)
 
 
+# ---------------- Cache ----------------
+
+EVENT_CONTEXT_CACHE_PATH = Path(
+    os.getenv("EVENT_CONTEXT_CACHE_PATH", "data/eval/event_context_cache.jsonl")
+)
+EVENT_CONTEXT_CACHE_TTL_S = int(
+    os.getenv("EVENT_CONTEXT_CACHE_TTL_S", str(7 * 24 * 3600))
+)
+
+# in-memory: key -> (created_at_epoch, EventWebContext)
+_EVENT_CONTEXT_CACHE: Dict[str, Tuple[float, EventWebContext]] = {}
+_CACHE_LOADED = False
+
+
+def _event_cache_key(
+    *,
+    title: str,
+    event_url: Optional[str],
+    context_model: str,
+    max_results: int,
+) -> str:
+    """
+    Stable cache key across runs.
+
+    Include context_model/max_results since they can change chosen URLs and summaries.
+    """
+    base = "|".join(
+        [
+            (title or "").strip().lower(),
+            (event_url or "").strip().lower(),
+            str(context_model),
+            str(max_results),
+        ]
+    )
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
+
+
+def _load_cache_once() -> None:
+    global _CACHE_LOADED
+    if _CACHE_LOADED:
+        return
+    _CACHE_LOADED = True
+
+    if not EVENT_CONTEXT_CACHE_PATH.exists():
+        return
+
+    try:
+        with EVENT_CONTEXT_CACHE_PATH.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                d = json.loads(line)
+
+                key = str(d.get("key", "")).strip()
+                created_at = float(d.get("created_at", 0) or 0)
+                value = d.get("value")
+
+                if not key or not isinstance(value, dict):
+                    continue
+
+                # TTL filtering at load time keeps memory clean
+                if created_at and (time.time() - created_at) > EVENT_CONTEXT_CACHE_TTL_S:
+                    continue
+
+                ctx = EventWebContext.model_validate(value)
+                _EVENT_CONTEXT_CACHE[key] = (created_at or time.time(), ctx)
+    except Exception as exc:
+        logger.warning(
+            "Failed to load event context cache (%s): %s",
+            EVENT_CONTEXT_CACHE_PATH,
+            exc,
+        )
+
+
+def _cache_get(key: str) -> Optional[EventWebContext]:
+    _load_cache_once()
+    item = _EVENT_CONTEXT_CACHE.get(key)
+    if not item:
+        return None
+
+    created_at, ctx = item
+    if created_at and (time.time() - created_at) > EVENT_CONTEXT_CACHE_TTL_S:
+        # Expired: drop it
+        _EVENT_CONTEXT_CACHE.pop(key, None)
+        return None
+
+    return ctx
+
+
+def _cache_set(key: str, value: EventWebContext) -> None:
+    created_at = time.time()
+    _EVENT_CONTEXT_CACHE[key] = (created_at, value)
+
+    try:
+        EVENT_CONTEXT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with EVENT_CONTEXT_CACHE_PATH.open("a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "key": key,
+                        "created_at": created_at,
+                        "value": value.model_dump(),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except Exception as exc:
+        logger.warning("Failed to persist event context cache: %s", exc)
+
+
 # ---------------- Helpers ----------------
 
 _TITLE_YEAR_RE = re.compile(r"(19|20)\d{2}")
@@ -128,7 +244,10 @@ def _domain(url: str) -> str:
 
 def _is_social(url: str) -> bool:
     d = _domain(url)
-    return any(bad in d for bad in ("facebook.com", "instagram.com", "twitter.com", "x.com", "youtube.com", "tiktok.com"))
+    return any(
+        bad in d
+        for bad in ("facebook.com", "instagram.com", "twitter.com", "x.com", "youtube.com", "tiktok.com")
+    )
 
 
 def _looks_like_dotwatcher(url: str) -> bool:
@@ -356,6 +475,9 @@ async def event_web_search(
     - prefer article_id (DB-backed)
     - else event_title
     - if event_url is provided, try fetching it directly first (more accurate than web search)
+
+    Added:
+    - caching (disk + in-memory) with TTL
     """
     # Normalize inputs
     title: Optional[str] = None
@@ -367,6 +489,18 @@ async def event_web_search(
     title = (title or "").strip() or None
     event_url = (event_url or "").strip() or None
 
+    # Cache key (works even when title is None)
+    cache_key = _event_cache_key(
+        title=title or "",
+        event_url=event_url,
+        context_model=context_model,
+        max_results=max_results,
+    )
+
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     # If we have an explicit URL, try to summarize it directly first
     if event_url:
         page_text = await _fetch_page_text(event_url)
@@ -377,7 +511,7 @@ async def event_web_search(
                 source_url=event_url,
                 model_name=context_model,
             )
-            return EventWebContext(
+            out = EventWebContext(
                 event_title=title or event_url,
                 search_query="",
                 official_url=None if _looks_like_dotwatcher(event_url) else event_url,
@@ -385,11 +519,15 @@ async def event_web_search(
                 context=ctx_summary,
                 results=[],
             )
+            _cache_set(cache_key, out)
+            return out
         # If fetch failed, fall back to search using title (if available)
 
     if not title:
         logger.warning("event_web_search called without usable identifier (no title, no fetchable URL).")
-        return EventWebContext(event_title="[unknown event]", search_query="")
+        out = EventWebContext(event_title="[unknown event]", search_query="")
+        _cache_set(cache_key, out)
+        return out
 
     title_for_search = _strip_year(title)
     base_query = f"{title_for_search} official site rules route registration"
@@ -401,7 +539,7 @@ async def event_web_search(
         context_model=context_model,
     )
 
-    return EventWebContext(
+    out = EventWebContext(
         event_title=title,
         search_query=base_query,
         official_url=official_url,
@@ -409,3 +547,5 @@ async def event_web_search(
         context=context_summary,
         results=results,
     )
+    _cache_set(cache_key, out)
+    return out

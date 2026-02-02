@@ -58,11 +58,11 @@ The KB is derived from DotWatcher.cc “Bikes of …” articles and represents 
 
 - Components (drivetrain, wheels, tyres, electronics)
 
-- - Gear and kit (bags, sleep system, navigation, power)
+- Gear and kit (bags, sleep system, navigation, power)
 
-Free-text descriptions preserved for semantic retrieval
+- Free-text descriptions preserved for semantic retrieval
 
-- This combination allows both structured querying (e.g. filters) and semantic similarity search.
+This combination allows both structured querying (e.g. filters) and semantic similarity search.
 
 ## Architecture of the Knowledge Base
 
@@ -75,8 +75,6 @@ The knowledge base is stored across two complementary systems:
 - Stores cleaned and normalized rider records
 
 - Enables deterministic queries (filters by tyre width, frame type, electronic shifting, year, etc.)
-
-Schema is derived from Pydantic models used throughout the project
 
 Typical use cases:
 
@@ -161,3 +159,85 @@ Instead, it:
 - Produces a grounded, explainable answer
 
 This ensures that recommendations are based on real historical setups, not hallucinated configurations.
+
+## Evaluation
+
+### Retrieval evaluation 
+
+This module aims to evaluate and improve **retrieval quality** for a bikepacking / ultracycling setup recommender. This evaluation is done **before** evaluating recommendation text quality.
+
+The logic is based on **retrieval-first**: given a natural-language query, retrieve relevant rider setups (from DotWatcher-style articles) as early as possible in the ranked list.
+
+---
+
+#### Data & Index
+
+- **Source**: Parsed rider setup articles (DotWatcher, etc.)
+- **Storage**: Qdrant vector database
+- **Indexing unit**: Text chunks
+
+#### Payload includes
+- `rider_id` (stable document ID)
+- `text` (compact setup description)
+- Structured fields:
+  - `event_key`
+  - `frame_type`
+  - `tyre_width`
+  - `electronic_shifting`
+  - …
+
+**Important**: Since a single rider may have multiple chunks there is deduplication by `rider_id` 
+
+---
+
+#### Queries & Ground Truth
+
+There are three datasets used for the evaluation of the retriever.
+
+- `queries.jsonl`
+  - Natural-language queries
+  - Mix of constraint-heavy and exploratory queries
+
+- `qrels.jsonl`
+  - Manually labeled relevant `rider_id`
+
+#### Relevance
+- **Binary relevance** used for retrieval metrics
+- **Graded relevance** reserved for later evaluation (e.g. nDCG)
+
+---
+
+####  Pipeline (per query)
+
+**1. Dense Retrieval**
+- Embedding-based search via Qdrant
+- Oversampling enabled when reranking is active (e.g. `k × 5`)
+- Retrieval latency measured separately
+
+**2. Deduplication**
+- Deduplicate by `rider_id`
+- Keep the chunk with the **best dense score**
+- Track diagnostics: `dedupe_in → dedupe_out`
+
+**3. Baseline Ranking**
+- Rank deduplicated hits by **dense similarity only**
+- Serves as the **safety baseline**
+
+**4. Deterministic Reranking**
+- Rule-based, payload-aware reranker
+- Soft additive boosts (e.g. tyres, gearing, shifting, event match)
+- **Global clamp** ensures dense similarity always dominates
+- Rerank latency measured separately (≈ < 1 ms)
+
+**5. Safe Fallback Logic**
+Applied **only on labeled queries**:
+- If reranking **hurts hitrate@k** → fallback to baseline
+- If hitrate ties but **MRR@k decreases** → fallback to baseline
+
+This guarantees **no metric regression** during tuning.
+
+**6. Final Ranking**
+- Either reranked or baseline ranking (after fallback)
+- Top-k results used for metric computation
+
+
