@@ -340,31 +340,112 @@ def parse_riders(cleaned_body: str, article_title: str) -> List[Rider]:
 # Main
 # ---------------------------------------------------------------------
 
+def _iter_jsonl(path: Path):
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            yield json.loads(line)
+
+
+def _load_articles(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(f"Input not found: {path}")
+
+    suffix = path.suffix.lower()
+    if suffix == ".jsonl":
+        return list(_iter_jsonl(path))
+
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if isinstance(data, dict):
+        return [data]
+    if isinstance(data, list):
+        return data
+
+    raise ValueError("Unexpected input format: expected list/dict JSON or JSONL rows.")
+
+
+def _latest_raw_new_snapshot(raw_snap_dir: Path) -> Path:
+    files = sorted(
+        list(raw_snap_dir.glob("dotwatcher_bikes_raw_new_*.json")) +
+        list(raw_snap_dir.glob("dotwatcher_bikes_raw_new_*.jsonl"))
+    )
+    if not files:
+        raise FileNotFoundError(
+            f"No raw new-only snapshots found in {raw_snap_dir}. "
+            f"Expected dotwatcher_bikes_raw_new_*.json or .jsonl"
+        )
+    return files[-1]
+
+
+def _extract_run_id_from_raw_snapshot(path: Path) -> str:
+    # dotwatcher_bikes_raw_new_<RUN_ID>.jsonl
+    name = path.name
+    prefix = "dotwatcher_bikes_raw_new_"
+    if prefix in name:
+        return name.split(prefix, 1)[1].split(".", 1)[0]
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+
 def main() -> None:
+    import argparse
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    in_path = Path("data/dotwatcher_bikes_raw.json")
-    out_path = Path("data/dotwatcher_bikes_cleaned.json")
+    parser = argparse.ArgumentParser(description="Clean DotWatcher raw snapshots into cleaned snapshots.")
+    parser.add_argument(
+        "--input",
+        type=str,
+        default="",
+        help="Path to raw snapshot (.json or .jsonl). If omitted, uses latest raw new-only snapshot in data/snapshots/raw/.",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="",
+        help="Output path for cleaned snapshot (.json). If omitted, writes to data/snapshots/clean/ with matching run_id.",
+    )
+    parser.add_argument(
+        "--update-latest",
+        action="store_true",
+        help="Also update data/dotwatcher_bikes_cleaned.json by merging new cleaned rows.",
+    )
+    args = parser.parse_args()
+
+    raw_snap_dir = Path("data/snapshots/raw")
+    clean_snap_dir = Path("data/snapshots/clean")
+    clean_snap_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) Resolve input
+    in_path = Path(args.input) if args.input else _latest_raw_new_snapshot(raw_snap_dir)
+    run_id = _extract_run_id_from_raw_snapshot(in_path)
+
+    # 2) Resolve output
+    if args.output:
+        out_path = Path(args.output)
+    else:
+        out_path = clean_snap_dir / f"dotwatcher_bikes_cleaned_new_{run_id}.json"
 
     logger.info("Loading raw articles from %s", in_path)
-    with in_path.open("r", encoding="utf-8") as f:
-        articles = json.load(f)
-
+    articles = _load_articles(in_path)
     logger.info("Processing %d articles", len(articles))
-    
+
+    # 3) Apply your existing cleaning/parsing logic
     for idx, item in enumerate(articles):
         raw_body = item.get("body", "")
         title = item.get("title", f"article_{idx}")
-        
-        title = re.sub(r"(?i)bikes of", "", title).strip()
 
-        articles[idx]["title"] = title
-        
+        title = re.sub(r"(?i)bikes of", "", title).strip()
+        item["title"] = title
+
         cleaned = clean_body(raw_body)
-        item["body"] = cleaned  # keep cleaned body in final JSON
+        item["body"] = cleaned
 
         riders = parse_riders(cleaned, title)
         item["riders"] = [r.model_dump() for r in riders]
@@ -376,16 +457,42 @@ def main() -> None:
             len(riders),
         )
 
-    # quick sanity log on first article
-    if articles:
-        sample_riders = articles[0].get("riders", [])[:3]
-        logger.info("Sample riders from first article: %s", sample_riders)
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # 4) Write cleaned new-only snapshot
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(articles, f, ensure_ascii=False, indent=2)
 
-    logger.info("Saved cleaned data to %s", out_path)
+    logger.info("Saved cleaned new-only snapshot to %s", out_path)
+
+    # 5) Optional: update latest cleaned full file (merge by url, append new)
+    if args.update_latest:
+        latest_path = Path("data/dotwatcher_bikes_cleaned.json")
+        existing_urls = set()
+
+        merged = []
+        if latest_path.exists():
+            with latest_path.open("r", encoding="utf-8") as f:
+                existing = json.load(f)
+            if isinstance(existing, list):
+                merged.extend(existing)
+                for row in existing:
+                    url = row.get("url")
+                    if url:
+                        existing_urls.add(url)
+
+        new_added = 0
+        for row in articles:
+            url = row.get("url")
+            if not url or url in existing_urls:
+                continue
+            merged.append(row)
+            existing_urls.add(url)
+            new_added += 1
+
+        latest_path.parent.mkdir(parents=True, exist_ok=True)
+        with latest_path.open("w", encoding="utf-8") as f:
+            json.dump(merged, f, ensure_ascii=False, indent=2)
+
+        logger.info("Updated latest cleaned file %s (added %d new rows)", latest_path, new_added)
 
 
 if __name__ == "__main__":
