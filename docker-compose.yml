@@ -1,9 +1,20 @@
-version: "3.8"
 services:
-  qdrant:
-    image: qdrant/qdrant:v1.16.1
-    container_name: qdrant
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: baikpacking-postgres
+    environment:
+      POSTGRES_DB: baikpacking
+      POSTGRES_USER: baikpacking
+      POSTGRES_PASSWORD: baikpacking
     ports:
-      - "6333:6333"
+      - "5433:5432"
     volumes:
-      - ./qdrant_storage:/qdrant/storage
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U baikpacking -d baikpacking"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pg_data:
