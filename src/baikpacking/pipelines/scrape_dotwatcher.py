@@ -6,6 +6,7 @@ from typing import Iterable
 from baikpacking.scraper.browser import browser
 from baikpacking.scraper.get_data import get_html, extract_article_links, parse_article
 
+
 BASE = "https://dotwatcher.cc/features/bikes-of?page="
 
 OUT_DIR = Path("data")
@@ -13,6 +14,7 @@ SNAP_DIR = OUT_DIR / "snapshots" / "raw"
 
 OUT_JSONL = OUT_DIR / "dotwatcher_bikes_raw.jsonl"  # accumulated (append-only)
 OUT_JSON = OUT_DIR / "dotwatcher_bikes_raw.json"    # regenerated snapshot (optional)
+
 
 # Safety cap + early-stop in case there are no new articles
 MAX_PAGES = 50
@@ -41,6 +43,10 @@ def _load_existing_urls(path: Path) -> set[str]:
 def main():
     OUT_DIR.mkdir(exist_ok=True)
     SNAP_DIR.mkdir(parents=True, exist_ok=True)
+    
+    
+    no_new_marker = SNAP_DIR / ".last_scrape_no_new"
+    new_marker = SNAP_DIR / ".last_scrape_new"
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     snap_jsonl = SNAP_DIR / f"dotwatcher_bikes_raw_new_{run_id}.jsonl"
@@ -48,6 +54,8 @@ def main():
 
     existing_urls = _load_existing_urls(OUT_JSONL)
     print(f"Existing articles in accumulated JSONL: {len(existing_urls)}")
+    
+    
 
     all_links: list[str] = []
     new_articles: list[dict] = []
@@ -74,7 +82,7 @@ def main():
 
             all_links.extend(links)
 
-            # 🔑 EARLY STOP: once a page yields 0 new links, the next pages are older
+            # EARLY STOP: once a page yields 0 new links, the next pages are older
             if not new_links_on_page:
                 print("  No new articles on this page, stopping crawl.")
                 break
@@ -97,7 +105,11 @@ def main():
 
     if not new_articles:
         print("No new articles found. Snapshot not created. Accumulated JSONL unchanged.")
+        if new_marker.exists():
+            new_marker.unlink()
+        no_new_marker.write_text(datetime.now().isoformat() + "\n", encoding="utf-8")
         return
+   
 
     # 4) Write snapshot containing ONLY new articles
     with snap_jsonl.open("w", encoding="utf-8") as f:
@@ -107,6 +119,7 @@ def main():
 
     with snap_json.open("w", encoding="utf-8") as f:
         json.dump(new_articles, f, ensure_ascii=False, indent=2)
+    
 
     # 5) Append new articles to accumulated JSONL (append-only)
     with OUT_JSONL.open("a", encoding="utf-8") as f:
@@ -118,12 +131,19 @@ def main():
     all_articles = list(_iter_jsonl(OUT_JSONL))
     with OUT_JSON.open("w", encoding="utf-8") as f:
         json.dump(all_articles, f, ensure_ascii=False, indent=2)
+    
+    if no_new_marker.exists():
+        no_new_marker.unlink()
+    new_marker.write_text(str(snap_jsonl) + "\n", encoding="utf-8")
+                
+    
 
     print(f"\nAdded {len(new_articles)} new articles.")
     print(f"Snapshot JSONL (new only): {snap_jsonl}")
     print(f"Snapshot JSON  (new only): {snap_json}")
     print(f"Accumulated JSONL updated: {OUT_JSONL}")
     print(f"Full JSON snapshot updated: {OUT_JSON}")
+    
 
 
 if __name__ == "__main__":

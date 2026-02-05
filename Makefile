@@ -3,7 +3,8 @@ SHELL := /bin/bash
 UV ?= uv run
 PY ?= python
 
-export $(cat .env | xargs)
+-include .env
+export
 
 
 PG_PORT ?= 5433
@@ -11,7 +12,6 @@ PG_CONTAINER ?= baikpacking-postgres
 PG_USER ?= baikpacking
 PG_DB ?= baikpacking
 PG_VOLUME ?= pg_data
-
 
 # -------------------------
 # Docker (Postgres / infra)
@@ -167,9 +167,12 @@ ollama-check:
 DATA_DIR := data
 SNAP_RAW_DIR := $(DATA_DIR)/snapshots/raw
 SNAP_CLEAN_DIR := $(DATA_DIR)/snapshots/clean
+KB_LOAD_MARKER := $(DATA_DIR)/snapshots/.last_db_load
 
 RAW_SNAP_GLOB := dotwatcher_bikes_raw_new_*.jsonl
 CLEAN_SNAP_GLOB := dotwatcher_bikes_cleaned_new_*.json
+
+
 
 .PHONY: help kb-update kb-scrape kb-clean kb-load kb-check
 
@@ -190,28 +193,33 @@ kb-clean:
 	$(UV) $(PY) -m baikpacking.scraper.clean_json --update-latest
 
 kb-load:
-	$(UV) $(PY) -m baikpacking.db.data_loader
-
-kb-update: kb-scrape
-	@RAW_LATEST="$$(ls -1t $(SNAP_RAW_DIR)/$(RAW_SNAP_GLOB) 2>/dev/null | head -n 1)"; \
-	CLEAN_LATEST="$$(ls -1t $(SNAP_CLEAN_DIR)/$(CLEAN_SNAP_GLOB) 2>/dev/null | head -n 1)"; \
-	if [[ -z "$$RAW_LATEST" ]]; then \
-		echo "No raw new-only snapshots found in $(SNAP_RAW_DIR). Nothing to do."; \
-		exit 0; \
-	fi; \
+	@CLEAN_LATEST="$$(ls -1t $(SNAP_CLEAN_DIR)/$(CLEAN_SNAP_GLOB) 2>/dev/null | head -n 1)"; \
 	if [[ -z "$$CLEAN_LATEST" ]]; then \
-		echo "No clean new-only snapshots found yet. Running clean + load..."; \
-		$(MAKE) kb-clean; \
-		$(MAKE) kb-load; \
+		echo "No clean new-only snapshots found in $(SNAP_CLEAN_DIR)."; \
+		exit 1; \
+	fi; \
+	echo "Latest clean snapshot: $$CLEAN_LATEST"; \
+	$(UV) $(PY) -m baikpacking.db.data_loader --input "$$CLEAN_LATEST"
+
+kb-update:
+	@$(MAKE) kb-scrape
+	@NEW_MARKER="$(SNAP_RAW_DIR)/.last_scrape_new"; \
+	if [[ ! -f "$$NEW_MARKER" ]]; then \
+		echo "No new raw snapshot created by scrape. Skipping clean/load."; \
 		exit 0; \
 	fi; \
-	if [[ "$$RAW_LATEST" -nt "$$CLEAN_LATEST" ]]; then \
-		echo "New raw snapshot detected: $$RAW_LATEST"; \
-		$(MAKE) kb-clean; \
-		$(MAKE) kb-load; \
-	else \
-		echo "No new raw snapshot since last clean snapshot. Skipping clean/load."; \
-	fi
+	RAW_LATEST="$$(tail -n 1 "$$NEW_MARKER")"; \
+	echo "New raw snapshot created: $$RAW_LATEST"; \
+	$(MAKE) kb-clean; \
+	CLEAN_LATEST="$$(ls -1t $(SNAP_CLEAN_DIR)/$(CLEAN_SNAP_GLOB) 2>/dev/null | head -n 1)"; \
+	if [[ -z "$$CLEAN_LATEST" ]]; then \
+		echo "No clean new-only snapshots found in $(SNAP_CLEAN_DIR). Skipping DB load."; \
+		rm -f "$$NEW_MARKER"; \
+		exit 0; \
+	fi; \
+	echo "Latest clean snapshot: $$CLEAN_LATEST"; \
+	$(UV) $(PY) -m baikpacking.db.data_loader --input "$$CLEAN_LATEST"; \
+	rm -f "$$NEW_MARKER"
 
 kb-check:
 	@echo ""
@@ -221,3 +229,12 @@ kb-check:
 	@echo "Latest clean new-only snapshot:"
 	@ls -1t $(SNAP_CLEAN_DIR)/$(CLEAN_SNAP_GLOB) 2>/dev/null | head -n 3 || true
 	@echo ""
+
+.PHONY: kb-backfill
+kb-backfill:
+	$(UV) $(PY) -m baikpacking.db.data_loader --input data/dotwatcher_bikes_cleaned.json
+
+.PHONY: kb-load-file
+kb-load-file:
+	@if [[ -z "$(FILE)" ]]; then echo "Usage: make kb-load-file FILE=path/to/snapshot.json"; exit 1; fi
+	$(UV) $(PY) -m baikpacking.db.data_loader --input "$(FILE)"
