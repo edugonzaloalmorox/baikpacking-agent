@@ -220,13 +220,60 @@ This guarantees **no metric regression** during tuning.
 
 ---
 
-## How to launch the system
+# 🚀 How to launch the system
 
 The project is designed to be run via a **Makefile**, ensuring reproducibility and minimal setup friction.
 
-### Prerequisites
+## Prerequisites
 
 - Docker & Docker Compose
 - Python 3.11+
 - `make`
 - An OpenAI-compatible API key
+
+## Launching the infrastructure
+
+Start the required infrastructure (Postgres + pgvector) with:
+
+```bash
+make pg-up
+```
+
+## Setting up embeddings with Ollama (local)
+
+If you plan to generate embeddings locally using Ollama, start the Ollama server and pull the embedding model defined in the .env file:
+
+
+```bash
+make ollama-up
+```
+
+- Check that Ollama is installed and available
+
+- Start the Ollama server (ollama serve) if it is not already running
+
+- Verify the server is responding on http://localhost:11434
+
+- Pull the embedding model specified in EMB_EMBEDDING_MODEL
+(e.g. `mxbai-embed-large:335m`)
+
+
+## Updating the knowledge base (end-to-end)
+
+To run the full incremental knowledge base update pipeline, execute:
+
+make kb-update
+
+
+This command performs, in order:
+
+Scraping
+Fetches new “Bikes of…” articles from DotWatcher (incremental; stops when no new content is found).
+
+Cleaning
+Normalizes and cleans only the newly scraped articles, producing a new-only cleaned snapshot.
+
+Database loading
+Inserts only new articles and riders into PostgreSQL (idempotent, no duplicates).
+
+If no new articles are found, the pipeline exits early without re-processing or touching the database.
