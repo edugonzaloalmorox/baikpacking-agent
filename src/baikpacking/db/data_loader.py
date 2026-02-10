@@ -178,6 +178,38 @@ INSERT INTO riders (
 
 REQUIRED_TABLES = ("articles", "riders")
 
+FETCH_RIDERS_SQL = """
+SELECT
+  id,
+  article_id,
+  name,
+  age,
+  location,
+  bike,
+  key_items,
+  frame_type,
+  frame_material,
+  wheel_size,
+  tyre_width,
+  electronic_shifting,
+  raw
+FROM riders
+ORDER BY id;
+"""
+
+TRUNCATE_RIDER_EMBEDDINGS_SQL = "TRUNCATE TABLE rider_embeddings;"
+
+UPSERT_RIDER_EMBEDDINGS_SQL = """
+INSERT INTO rider_embeddings (rider_id, embedding, model)
+VALUES %s
+ON CONFLICT (rider_id)
+DO UPDATE SET
+  embedding = EXCLUDED.embedding,
+  model = EXCLUDED.model,
+  updated_at = now();
+"""
+
+
 
 def assert_articles_url_unique(cur) -> None:
     """
@@ -310,6 +342,57 @@ def load_latest_snapshot_into_db(
         "inserted_riders": inserted_riders,
         "skipped_no_url": skipped_no_url,
     }
+
+def fetch_riders(conn) -> List[Dict[str, Any]]:
+    """
+    Fetch riders from Postgres as list[dict].
+    This is the source for embedding.
+    """
+    with conn.cursor() as cur:
+        cur.execute(FETCH_RIDERS_SQL)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def truncate_rider_embeddings(conn) -> None:
+    """
+    Clear rider_embeddings table (for a full rebuild).
+    """
+    with conn.cursor() as cur:
+        cur.execute(TRUNCATE_RIDER_EMBEDDINGS_SQL)
+    conn.commit()
+
+
+def upsert_rider_embeddings(
+    conn,
+    records: List[Tuple[int, List[float], str]],
+    page_size: int = 500,
+) -> int:
+    """
+    Upsert embeddings into rider_embeddings in batch.
+
+    Args:
+        conn: psycopg2 connection
+        records: list of (rider_id, embedding_vector, model_name)
+        page_size: batch size for execute_values
+
+    Returns:
+        Number of rows attempted (len(records)).
+    """
+    if not records:
+        return 0
+
+    with conn.cursor() as cur:
+        execute_values(
+            cur,
+            UPSERT_RIDER_EMBEDDINGS_SQL,
+            records,
+            page_size=page_size,
+        )
+    conn.commit()
+    return len(records)
+
+
 
 # ---------------------------------------------------------------------------
 # Main

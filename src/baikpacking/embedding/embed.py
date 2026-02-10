@@ -1,57 +1,14 @@
 import os
-import json
-import unicodedata
-import hashlib
-from pathlib import Path
-from typing import List, Dict, Optional, Union, Any
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import requests
 
 from .config import Settings
-from baikpacking.tools.events import EVENT_ALIASES
 
 settings = Settings()
 
 _SESSION = requests.Session()
 _TIMEOUT_S = 30
-
-
-def _normalize_text_for_match(s: str) -> str:
-    if not s:
-        return ""
-    s = s.lower()
-
-    # treat typical URL/title separators as spaces
-    for sep in ("-", "_", "/", "."):
-        s = s.replace(sep, " ")
-
-    s = unicodedata.normalize("NFD", s)
-    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
-
-    return "".join(ch for ch in s if ch.isalnum() or ch.isspace())
-
-
-
-_NORMALIZED_EVENT_ALIASES: Dict[str, List[str]] = {
-    key: [_normalize_text_for_match(a) for a in aliases]
-    for key, aliases in EVENT_ALIASES.items()
-}
-
-
-def infer_event_key_from_title(title: str) -> Optional[str]:
-    norm = _normalize_text_for_match(title)
-    if not norm:
-        return None
-    for key, aliases in _NORMALIZED_EVENT_ALIASES.items():
-        for alias in aliases:
-            if alias and alias in norm:
-                return key
-    return None
-
-
-def _stable_rider_id(event_url: str, event_title: str, rider_name: str) -> int:
-    key = f"{event_url}|{event_title}|{rider_name}".encode("utf-8")
-    return int(hashlib.blake2b(key, digest_size=8).hexdigest(), 16)
 
 
 def _post_ollama(url: str, payload: dict) -> dict:
@@ -67,6 +24,10 @@ def _post_ollama(url: str, payload: dict) -> dict:
 
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
+    """
+    Embed a list of texts using Ollama embeddings endpoint.
+    Returns a list of vectors (list[float]).
+    """
     if not texts:
         return []
 
@@ -85,117 +46,73 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     return vectors
 
 
-def build_embedding_text(rider: Dict[str, Any]) -> str:
-    parts = [
-        rider.get("name", ""),
-        rider.get("age", ""),
-        rider.get("location", ""),
-        rider.get("bike", ""),
-        rider.get("frame_type", ""),
-        rider.get("frame_material", ""),
-        rider.get("wheel_size", ""),
-        rider.get("tyre_width", ""),
-        rider.get("key_items", ""),
-    ]
-    if rider.get("event_title"):
-        parts.append(f"Event: {rider['event_title']}")
-    if rider.get("event_key"):
-        parts.append(f"EventKey: {rider['event_key']}")
-    return " | ".join(p for p in parts if p)
+def build_rider_embedding_text(r: Mapping[str, Any]) -> str:
+    """
+    Deterministic rider text builder.
+    Works even if some columns are missing in the DB row.
+    """
+    def g(*keys: str) -> str:
+        for k in keys:
+            v = r.get(k)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+        return ""
+
+    parts: List[str] = []
+
+    # identifiers / context first
+    name = g("name", "rider_name")
+    if name:
+        parts.append(f"Rider: {name}")
+
+    event = g("event_title", "event", "event_name")
+    if event:
+        parts.append(f"Event: {event}")
+
+    # setup details (keep order stable)
+    for label, keys in [
+        ("Location", ("location", "country")),
+        ("Bike", ("bike", "bicycle")),
+        ("Frame type", ("frame_type",)),
+        ("Frame material", ("frame_material",)),
+        ("Wheel size", ("wheel_size",)),
+        ("Tyre width", ("tyre_width", "tire_width")),
+        ("Key items", ("key_items", "notes", "setup_notes")),
+    ]:
+        val = g(*keys)
+        if val:
+            parts.append(f"{label}: {val}")
+
+    return " | ".join(parts)
 
 
-def chunk_text(text: str, max_chars: int = 800, overlap: int = 100) -> List[str]:
-    if not text:
-        return []
-    if len(text) <= max_chars:
-        return [text]
+def embed_riders_rows(
+    rows: Sequence[Mapping[str, Any]],
+    expected_dim: int = 1024,
+) -> List[Tuple[int, List[float]]]:
+    """
+    Given DB rider rows, embed 1 vector per rider.
 
-    chunks: List[str] = []
-    start = 0
-    n = len(text)
+    Returns: [(rider_id, vector), ...]
+    """
+    texts: List[str] = []
+    ids: List[int] = []
 
-    while start < n:
-        end = min(start + max_chars, n)
-        chunks.append(text[start:end])
-        if end >= n:
-            break
-        start = max(0, end - overlap)
+    for r in rows:
+        rider_id = r.get("id") or r.get("rider_id")
+        if rider_id is None:
+            raise ValueError("Row missing rider id (expected 'id' or 'rider_id').")
+        ids.append(int(rider_id))
+        texts.append(build_rider_embedding_text(r))
 
-    return chunks
+    vectors = embed_texts(texts)
 
+    if len(vectors) != len(ids):
+        raise RuntimeError(f"Embedding count mismatch: {len(vectors)} != {len(ids)}")
 
-def embed_rider_chunks(
-    rider: Dict[str, Any],
-    event_title: str,
-    event_url: str,
-    event_key: Optional[str],
-    max_chars: int = 800,
-    overlap: int = 100,
-) -> List[Dict[str, Any]]:
-    # ensure build_embedding_text sees event metadata
-    rider = dict(rider)
-    rider["event_title"] = event_title
-    rider["event_url"] = event_url
-    rider["event_key"] = event_key
+    if vectors and len(vectors[0]) != expected_dim:
+        raise RuntimeError(
+            f"Embedding dimension mismatch: got {len(vectors[0])}, expected {expected_dim}"
+        )
 
-    text = build_embedding_text(rider)
-    chunks = chunk_text(text, max_chars=max_chars, overlap=overlap)
-    if not chunks:
-        return []
-
-    vectors = embed_texts(chunks)
-    if len(vectors) != len(chunks):
-        raise RuntimeError(f"Embedding count mismatch: {len(vectors)} != {len(chunks)}")
-
-    payload_base = {
-        "rider_id": rider.get("rider_id"),
-        "name": rider.get("name"),
-        "event_title": event_title,
-        "event_url": event_url,
-        "frame_type": rider.get("frame_type"),
-        "frame_material": rider.get("frame_material"),
-        "wheel_size": rider.get("wheel_size"),
-        "tyre_width": rider.get("tyre_width"),
-        "electronic_shifting": rider.get("electronic_shifting"),
-        "event_key": event_key,
-    }
-
-    out: List[Dict[str, Any]] = []
-    for i, (chunk_text_value, vec) in enumerate(zip(chunks, vectors)):
-        out.append({**payload_base, "chunk_index": i, "text": chunk_text_value, "vector": vec})
-    return out
-
-
-def embed_riders_from_json(
-    json_path: Union[Path, str] = "data/dotwatcher_bikes_cleaned.json",
-    max_chars: int = 800,
-    overlap: int = 100,
-) -> List[Dict[str, Any]]:
-    path = Path(json_path)
-    articles = json.loads(path.read_text(encoding="utf-8"))
-
-    all_chunks: List[Dict[str, Any]] = []
-
-    for article in articles:
-        event_title = (article.get("title") or "").strip()
-        event_url = (article.get("url") or "").strip()
-
-        event_key = infer_event_key_from_title(event_title) or infer_event_key_from_title(event_url)
-
-
-        riders = article.get("riders") or []
-        for rider in riders:
-            r: Dict[str, Any] = dict(rider)
-            r["rider_id"] = _stable_rider_id(event_url, event_title, str(r.get("name") or ""))
-
-            chunks = embed_rider_chunks(
-                r,
-                event_title=event_title,
-                event_url=event_url,
-                event_key=event_key,
-                max_chars=max_chars,
-                overlap=overlap,
-            )
-            all_chunks.extend(chunks)
-
-    return all_chunks
+    return list(zip(ids, vectors))
