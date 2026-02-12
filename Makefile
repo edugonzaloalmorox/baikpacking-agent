@@ -167,22 +167,20 @@ ollama-check:
 DATA_DIR := data
 SNAP_RAW_DIR := $(DATA_DIR)/snapshots/raw
 SNAP_CLEAN_DIR := $(DATA_DIR)/snapshots/clean
-KB_LOAD_MARKER := $(DATA_DIR)/snapshots/.last_db_load
 
 RAW_SNAP_GLOB := dotwatcher_bikes_raw_new_*.jsonl
 CLEAN_SNAP_GLOB := dotwatcher_bikes_cleaned_new_*.json
 
-
-
-.PHONY: help kb-update kb-scrape kb-clean kb-load kb-check
+.PHONY: help kb-update kb-scrape kb-clean kb-load kb-embed kb-check
 
 help:
 	@echo ""
 	@echo "KB incremental:"
-	@echo "  make kb-update   scrape -> (if new) clean -> (if new) load"
+	@echo "  make kb-update   scrape -> (if new) clean -> (if new) load -> (if new) embed"
 	@echo "  make kb-scrape   run incremental scraper (raw new-only snapshots)"
 	@echo "  make kb-clean    clean latest raw new-only snapshot + merge latest cleaned"
 	@echo "  make kb-load     load latest cleaned new-only snapshot into DB"
+	@echo "  make kb-embed    embed riders into pgvector (incremental by default)"
 	@echo "  make kb-check    show latest snapshot files"
 	@echo ""
 
@@ -201,11 +199,14 @@ kb-load:
 	echo "Latest clean snapshot: $$CLEAN_LATEST"; \
 	$(UV) $(PY) -m baikpacking.db.data_loader --input "$$CLEAN_LATEST"
 
+kb-embed:
+	$(UV) $(PY) -m baikpacking.pipelines.embed_index
+
 kb-update:
 	@$(MAKE) kb-scrape
 	@NEW_MARKER="$(SNAP_RAW_DIR)/.last_scrape_new"; \
 	if [[ ! -f "$$NEW_MARKER" ]]; then \
-		echo "No new raw snapshot created by scrape. Skipping clean/load."; \
+		echo "No new raw snapshot created by scrape. Skipping clean/load/embed."; \
 		exit 0; \
 	fi; \
 	RAW_LATEST="$$(tail -n 1 "$$NEW_MARKER")"; \
@@ -213,12 +214,13 @@ kb-update:
 	$(MAKE) kb-clean; \
 	CLEAN_LATEST="$$(ls -1t $(SNAP_CLEAN_DIR)/$(CLEAN_SNAP_GLOB) 2>/dev/null | head -n 1)"; \
 	if [[ -z "$$CLEAN_LATEST" ]]; then \
-		echo "No clean new-only snapshots found in $(SNAP_CLEAN_DIR). Skipping DB load."; \
+		echo "No clean new-only snapshots found in $(SNAP_CLEAN_DIR). Skipping DB load/embed."; \
 		rm -f "$$NEW_MARKER"; \
 		exit 0; \
 	fi; \
 	echo "Latest clean snapshot: $$CLEAN_LATEST"; \
 	$(UV) $(PY) -m baikpacking.db.data_loader --input "$$CLEAN_LATEST"; \
+	$(MAKE) kb-embed; \
 	rm -f "$$NEW_MARKER"
 
 kb-check:
@@ -238,3 +240,31 @@ kb-backfill:
 kb-load-file:
 	@if [[ -z "$(FILE)" ]]; then echo "Usage: make kb-load-file FILE=path/to/snapshot.json"; exit 1; fi
 	$(UV) $(PY) -m baikpacking.db.data_loader --input "$(FILE)"
+
+.PHONY: up
+up: pg-up ollama-up kb-update
+
+# -------------------------
+# Dev bootstrap
+# -------------------------
+
+.PHONY: dev kb-status
+
+dev:
+	@echo ""
+	@echo "🚀 Starting development environment..."
+	@$(MAKE) pg-up
+	@$(MAKE) ollama-up
+	@$(MAKE) kb-update
+	@$(MAKE) kb-status
+	@echo ""
+	@echo "✅ Dev environment ready."
+	@echo ""
+
+kb-status:
+	@echo ""
+	@echo "📊 [status] Checking database state..."
+	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT COUNT(*) AS total_riders FROM riders;" || true
+	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT COUNT(*) AS total_embeddings FROM rider_embeddings;" || true
+	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT COUNT(*) AS riders_missing_embeddings FROM riders r LEFT JOIN rider_embeddings e ON r.id = e.rider_id WHERE e.rider_id IS NULL;" || true
+	@echo ""
