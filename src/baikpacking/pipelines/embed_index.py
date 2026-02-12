@@ -8,31 +8,47 @@ from baikpacking.db.data_loader import (
     fetch_riders,
     truncate_rider_embeddings,
     upsert_rider_embeddings,
+    fetch_riders_missing_embeddings,
 )
 
 settings = Settings()
 
 
-def run_embed_riders(rebuild: bool = False, expected_dim: int = 1024) -> None:
+def run_embed_riders(
+    rebuild: bool = False,
+    expected_dim: int = 1024,
+    embed_all: bool = False,
+) -> None:
     """
     Rebuild or incrementally upsert rider embeddings into Postgres/pgvector.
 
-    Flow:
-      1) fetch riders from Postgres
-      2) embed 1 vector per rider
-      3) upsert into rider_embeddings (PK = rider_id)
+    Default behavior (incremental):
+      - embed ONLY riders missing an embedding row
+
+    Full behavior (embed_all=True):
+      - embed ALL riders (useful if you changed the embedding model or text builder)
     """
     with get_pg_connection(autocommit=False) as conn:
         if rebuild:
             truncate_rider_embeddings(conn)
 
-        rows = fetch_riders(conn)
+        if rebuild or embed_all:
+            rows = fetch_riders(conn)
+            mode = "ALL riders"
+        else:
+            rows = fetch_riders_missing_embeddings(conn)
+            mode = "ONLY riders missing embeddings"
+
+        print(f"Mode: {mode}")
         print(f"Riders fetched: {len(rows)}")
+
+        if not rows:
+            print("Nothing to embed.")
+            return
 
         pairs = embed_riders_rows(rows, expected_dim=expected_dim)
         print(f"Embeddings computed: {len(pairs)}")
 
-        # Convert (rider_id, vector) -> (rider_id, vector, model)
         records: List[Tuple[int, List[float], str]] = [
             (rider_id, vec, settings.embedding_model) for (rider_id, vec) in pairs
         ]
@@ -49,6 +65,11 @@ def main() -> None:
         help="Truncate rider_embeddings before inserting (full rebuild).",
     )
     parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Embed all riders (overrides incremental behavior).",
+    )
+    parser.add_argument(
         "--dim",
         type=int,
         default=1024,
@@ -56,7 +77,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    run_embed_riders(rebuild=args.rebuild, expected_dim=args.dim)
+    run_embed_riders(
+        rebuild=args.rebuild,
+        expected_dim=args.dim,
+        embed_all=args.all,
+    )
 
 
 if __name__ == "__main__":

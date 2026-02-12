@@ -209,6 +209,27 @@ DO UPDATE SET
   updated_at = now();
 """
 
+FETCH_RIDERS_MISSING_EMB_SQL = """
+SELECT
+  r.id,
+  r.article_id,
+  r.name,
+  r.age,
+  r.location,
+  r.bike,
+  r.key_items,
+  r.frame_type,
+  r.frame_material,
+  r.wheel_size,
+  r.tyre_width,
+  r.electronic_shifting,
+  r.raw
+FROM riders r
+LEFT JOIN rider_embeddings e ON e.rider_id = r.id
+WHERE e.rider_id IS NULL
+ORDER BY r.id;
+"""
+
 
 
 def assert_articles_url_unique(cur) -> None:
@@ -361,6 +382,14 @@ def truncate_rider_embeddings(conn) -> None:
     with conn.cursor() as cur:
         cur.execute(TRUNCATE_RIDER_EMBEDDINGS_SQL)
     conn.commit()
+
+
+
+def fetch_riders_missing_embeddings(conn) -> List[Dict[str, Any]]:
+    with conn.cursor() as cur:
+        cur.execute(FETCH_RIDERS_MISSING_EMB_SQL)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
 def upsert_rider_embeddings(
