@@ -1,5 +1,7 @@
 import os
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+import time
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -11,39 +13,129 @@ _SESSION = requests.Session()
 _TIMEOUT_S = 30
 
 
+def _ollama_embeddings_url() -> str:
+    ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+    return f"{ollama_host.rstrip('/')}/api/embeddings"
+
+
 def _post_ollama(url: str, payload: dict) -> dict:
     last_exc: Exception | None = None
-    for _ in range(3):
+    # small backoff to avoid hammering under load
+    backoffs = [0.2, 0.5, 1.0]
+
+    for attempt in range(3):
         try:
             resp = _SESSION.post(url, json=payload, timeout=_TIMEOUT_S)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
             last_exc = e
+            if attempt < len(backoffs):
+                time.sleep(backoffs[attempt])
+
     raise RuntimeError(f"Ollama request failed after 3 attempts: {last_exc}")
 
 
-def embed_texts(texts: List[str]) -> List[List[float]]:
+def _extract_embedding(data: dict) -> List[float]:
+    emb = data.get("embedding")
+    if not emb or not isinstance(emb, list):
+        raise RuntimeError(f"Unexpected response from Ollama: {data}")
+    return emb
+
+
+def _check_dim(vectors: List[List[float]], expected_dim: Optional[int]) -> None:
+    if expected_dim is None:
+        return
+    if vectors and len(vectors[0]) != expected_dim:
+        raise RuntimeError(
+            f"Embedding dimension mismatch: got {len(vectors[0])}, expected {expected_dim}"
+        )
+
+
+def embed_texts(
+    texts: List[str],
+    *,
+    concurrent: bool = False,
+    max_workers: int = 8,
+    expected_dim: Optional[int] = None,
+) -> List[List[float]]:
     """
     Embed a list of texts using Ollama embeddings endpoint.
-    Returns a list of vectors (list[float]).
+    If concurrent=True, uses a ThreadPoolExecutor (recommended for chunking).
     """
     if not texts:
         return []
 
-    ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-    url = f"{ollama_host.rstrip('/')}/api/embeddings"
+    if concurrent:
+        vectors = embed_texts_concurrent(
+            texts,
+            max_workers=max_workers,
+            expected_dim=expected_dim,
+        )
+        return vectors
 
+    url = _ollama_embeddings_url()
     vectors: List[List[float]] = []
     for text in texts:
         payload = {"model": settings.embedding_model, "prompt": text}
         data = _post_ollama(url, payload)
-        emb = data.get("embedding")
-        if not emb:
-            raise RuntimeError(f"Unexpected response from Ollama: {data}")
-        vectors.append(emb)
+        vectors.append(_extract_embedding(data))
 
+    _check_dim(vectors, expected_dim)
     return vectors
+
+
+def embed_text(
+    text: str,
+    *,
+    expected_dim: Optional[int] = None,
+) -> List[float]:
+    vecs = embed_texts([text], expected_dim=expected_dim)
+    return vecs[0] if vecs else []
+
+
+def embed_texts_concurrent(
+    texts: List[str],
+    *,
+    max_workers: int = 8,
+    expected_dim: Optional[int] = None,
+) -> List[List[float]]:
+    """
+    Concurrent embedding (best for chunking).
+    Preserves input order.
+    """
+    if not texts:
+        return []
+
+    url = _ollama_embeddings_url()
+    model = settings.embedding_model
+
+    vectors: List[Optional[List[float]]] = [None] * len(texts)
+
+    def _one(i: int, text: str) -> tuple[int, List[float]]:
+        payload = {"model": model, "prompt": text}
+        try:
+            data = _post_ollama(url, payload)
+            return i, _extract_embedding(data)
+        except Exception as e:
+            preview = text[:200].replace("\n", " ")
+            raise RuntimeError(f"Embedding failed for index={i}, text_preview={preview!r}: {e}") from e
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(_one, i, t) for i, t in enumerate(texts)]
+        for fut in as_completed(futs):
+            i, emb = fut.result()
+            vectors[i] = emb
+
+    # ensure all filled
+    out: List[List[float]] = []
+    for v in vectors:
+        if v is None:
+            raise RuntimeError("Internal error: missing embedding result for one or more inputs.")
+        out.append(v)
+
+    _check_dim(out, expected_dim)
+    return out
 
 
 def build_rider_embedding_text(r: Mapping[str, Any]) -> str:
@@ -60,7 +152,6 @@ def build_rider_embedding_text(r: Mapping[str, Any]) -> str:
 
     parts: List[str] = []
 
-    # identifiers / context first
     name = g("name", "rider_name")
     if name:
         parts.append(f"Rider: {name}")
@@ -69,7 +160,6 @@ def build_rider_embedding_text(r: Mapping[str, Any]) -> str:
     if event:
         parts.append(f"Event: {event}")
 
-    # setup details (keep order stable)
     for label, keys in [
         ("Location", ("location", "country")),
         ("Bike", ("bike", "bicycle")),
@@ -89,10 +179,12 @@ def build_rider_embedding_text(r: Mapping[str, Any]) -> str:
 def embed_riders_rows(
     rows: Sequence[Mapping[str, Any]],
     expected_dim: int = 1024,
+    *,
+    concurrent: bool = False,
+    max_workers: int = 8,
 ) -> List[Tuple[int, List[float]]]:
     """
     Given DB rider rows, embed 1 vector per rider.
-
     Returns: [(rider_id, vector), ...]
     """
     texts: List[str] = []
@@ -105,14 +197,14 @@ def embed_riders_rows(
         ids.append(int(rider_id))
         texts.append(build_rider_embedding_text(r))
 
-    vectors = embed_texts(texts)
+    vectors = embed_texts(
+        texts,
+        concurrent=concurrent,
+        max_workers=max_workers,
+        expected_dim=expected_dim,
+    )
 
     if len(vectors) != len(ids):
         raise RuntimeError(f"Embedding count mismatch: {len(vectors)} != {len(ids)}")
-
-    if vectors and len(vectors[0]) != expected_dim:
-        raise RuntimeError(
-            f"Embedding dimension mismatch: got {len(vectors[0])}, expected {expected_dim}"
-        )
 
     return list(zip(ids, vectors))

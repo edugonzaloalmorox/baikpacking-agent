@@ -6,8 +6,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from psycopg2.extras import Json, execute_values
+from pgvector.psycopg2 import register_vector
 
 from baikpacking.db.db_connection import get_pg_connection
+from baikpacking.embedding.embed import embed_texts_concurrent
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -17,6 +19,13 @@ DEFAULT_SNAP_DIR = Path("data/snapshots/clean")
 DEFAULT_PATTERN_JSON = "dotwatcher_bikes_cleaned_new_*.json"
 DEFAULT_PATTERN_JSONL = "dotwatcher_bikes_cleaned_new_*.jsonl"
 
+# If Ollama embeddings model returns 1024 dims (current default check in embed.py),
+# keep this in sync with DB vector(N) and embed dimension checks.
+EXPECTED_EMBED_DIM = 1024
+
+# Chunk packing controls (simple & deterministic)
+KEY_ITEMS_CHUNK_MAX_CHARS = 280
+
 # ---------------------------------------------------------------------------
 # Helpers: snapshot discovery + parsing
 # ---------------------------------------------------------------------------
@@ -25,9 +34,7 @@ _TS_RE = re.compile(r".*_(\d{8})_(\d{6})\.(json|jsonl)$", re.IGNORECASE)
 
 
 def _extract_ts(path: Path) -> Optional[float]:
-    """
-    Extract YYYYMMDD_HHMMSS from filename (preferred), else None.
-    """
+    """Extract YYYYMMDD_HHMMSS from filename (preferred), else None."""
     m = _TS_RE.match(path.name)
     if not m:
         return None
@@ -94,6 +101,127 @@ def _load_input(path: Path) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Chunking helpers (based on riders.bike + riders.key_items)
+# ---------------------------------------------------------------------------
+
+def _norm_str(x: Any) -> str:
+    return "" if x is None else str(x).strip()
+
+
+_SPLIT_RE = re.compile(r"(?:\n+|•|\u2022|- |\t|;|,|\|)+")
+
+
+def split_key_items_to_phrases(key_items: Any) -> List[str]:
+    """Turn riders.key_items into a list of short phrases."""
+    if key_items is None:
+        return []
+
+    if isinstance(key_items, list):
+        out: List[str] = []
+        for item in key_items:
+            s = _norm_str(item)
+            if s:
+                out.append(s)
+        return out
+
+    s = _norm_str(key_items)
+    if not s:
+        return []
+
+    raw_parts = [p.strip() for p in _SPLIT_RE.split(s) if p and p.strip()]
+    seen = set()
+    out = []
+    for p in raw_parts:
+        k = p.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(p)
+    return out
+
+
+def pack_phrases_into_chunks(phrases: List[str], max_chars: int) -> List[str]:
+    """Pack short phrases into chunk strings up to ~max_chars."""
+    chunks: List[str] = []
+    buf: List[str] = []
+    size = 0
+
+    for p in phrases:
+        add_len = len(p) + (2 if buf else 0)  # "; "
+        if buf and (size + add_len) > max_chars:
+            chunks.append("; ".join(buf))
+            buf = [p]
+            size = len(p)
+        else:
+            size = size + add_len if buf else len(p)
+            buf.append(p)
+
+    if buf:
+        chunks.append("; ".join(buf))
+
+    return chunks
+
+
+def estimate_tokens_rough(text: str) -> int:
+    """Fast token estimate (~4 chars/token)."""
+    t = text.strip()
+    if not t:
+        return 0
+    return max(1, len(t) // 4)
+
+
+def build_rider_chunks_from_row(r: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Create chunk rows from riders.bike and riders.key_items.
+    Returns list of dicts: chunk_kind, chunk_ix, chunk_text, chunk_tokens
+    """
+    out: List[Dict[str, Any]] = []
+
+    bike = _norm_str(r.get("bike"))
+    key_items = r.get("key_items")
+
+    if bike:
+        # Keep chunk grounded in "bike" column but enrich with a few structured fields
+        extra_bits: List[str] = []
+        for k, label in [
+            ("frame_type", "frame_type"),
+            ("frame_material", "frame_material"),
+            ("wheel_size", "wheel_size"),
+            ("tyre_width", "tyre_width"),
+            ("electronic_shifting", "electronic_shifting"),
+        ]:
+            v = r.get(k)
+            if v is not None and str(v).strip():
+                extra_bits.append(f"{label}={str(v).strip()}")
+
+        bike_text = f"Bike: {bike}" + (f" ({', '.join(extra_bits)})" if extra_bits else "")
+        out.append(
+            {
+                "chunk_kind": "bike",
+                "chunk_ix": 0,
+                "chunk_text": bike_text,
+                "chunk_tokens": estimate_tokens_rough(bike_text),
+            }
+        )
+
+    phrases = split_key_items_to_phrases(key_items)
+    if phrases:
+        packed = pack_phrases_into_chunks(phrases, max_chars=KEY_ITEMS_CHUNK_MAX_CHARS)
+        for i, text in enumerate(packed):
+            chunk_text = f"Key items: {text}"
+            out.append(
+                {
+                    "chunk_kind": "key_items",
+                    "chunk_ix": i,
+                    "chunk_text": chunk_text,
+                    "chunk_tokens": estimate_tokens_rough(chunk_text),
+                }
+            )
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Normalization
 # ---------------------------------------------------------------------------
 
@@ -109,10 +237,7 @@ def _to_int_or_none(value: Any) -> Optional[int]:
 
 
 def normalize_article(article: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Map an article JSON dict into DB columns.
-    Keep full payload in raw for traceability.
-    """
+    """Map an article JSON dict into DB columns (keep full payload in raw)."""
     title = article.get("title") or article.get("article_title") or "Untitled"
     url = article.get("url") or article.get("article_url")
     body = article.get("body") or article.get("content") or article.get("text")
@@ -143,10 +268,7 @@ def normalize_rider(rider: Dict[str, Any], article_id: int) -> Dict[str, Any]:
 
 
 def extract_riders(article: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Your cleaned snapshots may store riders under different keys.
-    Keep this centralized so we don’t scatter heuristics everywhere.
-    """
+    """Extract riders list from a cleaned article record."""
     for key in ("riders", "rider_setups", "setups", "profiles", "people"):
         val = article.get(key)
         if isinstance(val, list):
@@ -155,13 +277,9 @@ def extract_riders(article: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# SQL (incremental)
+# SQL
 # ---------------------------------------------------------------------------
 
-# IMPORTANT:
-# - If url is NULL/empty, we skip (we can't link/dedupe reliably).
-# - We use ON CONFLICT DO NOTHING (no target) for compatibility with UNIQUE INDEX.
-# - Incremental behavior expects a uniqueness guarantee on articles.url (index or constraint).
 ARTICLE_UPSERT_SQL = """
 INSERT INTO articles (title, url, body, raw)
 VALUES %s
@@ -176,45 +294,15 @@ INSERT INTO riders (
 ) VALUES %s;
 """
 
-REQUIRED_TABLES = ("articles", "riders")
+# Chunk support
+REQUIRED_TABLES_BASE = ("articles", "riders")
+REQUIRED_TABLES_WITH_CHUNKS = ("articles", "riders", "rider_chunks")
 
-FETCH_RIDERS_SQL = """
-SELECT
-  id,
-  article_id,
-  name,
-  age,
-  location,
-  bike,
-  key_items,
-  frame_type,
-  frame_material,
-  wheel_size,
-  tyre_width,
-  electronic_shifting,
-  raw
-FROM riders
-ORDER BY id;
-"""
-
-TRUNCATE_RIDER_EMBEDDINGS_SQL = "TRUNCATE TABLE rider_embeddings;"
-
-UPSERT_RIDER_EMBEDDINGS_SQL = """
-INSERT INTO rider_embeddings (rider_id, embedding, model)
-VALUES %s
-ON CONFLICT (rider_id)
-DO UPDATE SET
-  embedding = EXCLUDED.embedding,
-  model = EXCLUDED.model,
-  updated_at = now();
-"""
-
-FETCH_RIDERS_MISSING_EMB_SQL = """
+FETCH_RIDERS_MISSING_CHUNKS_SQL = """
 SELECT
   r.id,
   r.article_id,
   r.name,
-  r.age,
   r.location,
   r.bike,
   r.key_items,
@@ -222,26 +310,53 @@ SELECT
   r.frame_material,
   r.wheel_size,
   r.tyre_width,
-  r.electronic_shifting,
-  r.raw
+  r.electronic_shifting
 FROM riders r
-LEFT JOIN rider_embeddings e ON e.rider_id = r.id
-WHERE e.rider_id IS NULL
+LEFT JOIN rider_chunks c ON c.rider_id = r.id
+WHERE c.rider_id IS NULL
 ORDER BY r.id;
 """
 
+FETCH_RIDERS_FOR_CHUNKS_SQL = """
+SELECT
+  id,
+  article_id,
+  name,
+  location,
+  bike,
+  key_items,
+  frame_type,
+  frame_material,
+  wheel_size,
+  tyre_width,
+  electronic_shifting
+FROM riders
+ORDER BY id;
+"""
 
+TRUNCATE_RIDER_CHUNKS_SQL = "TRUNCATE TABLE rider_chunks;"
+
+UPSERT_RIDER_CHUNKS_SQL = """
+INSERT INTO rider_chunks (
+  rider_id, chunk_kind, chunk_ix, chunk_text, chunk_tokens, embedding, model
+)
+VALUES %s
+ON CONFLICT (rider_id, chunk_kind, chunk_ix)
+DO UPDATE SET
+  chunk_text   = EXCLUDED.chunk_text,
+  chunk_tokens = EXCLUDED.chunk_tokens,
+  embedding    = EXCLUDED.embedding,
+  model        = EXCLUDED.model,
+  updated_at   = now();
+"""
+
+
+# ---------------------------------------------------------------------------
+# Assertions
+# ---------------------------------------------------------------------------
 
 def assert_articles_url_unique(cur) -> None:
-    """
-    Ensure there is a uniqueness guarantee for articles.url.
-
-    Since the schema creates a UNIQUE INDEX named idx_articles_url,
-    we assert that either:
-      - a UNIQUE constraint exists on (url), OR
-      - the UNIQUE INDEX idx_articles_url exists.
-    """
-    # Unique constraint on url?
+    """Ensure uniqueness guarantee for public.articles(url)."""
     cur.execute(
         """
         select 1
@@ -258,7 +373,6 @@ def assert_articles_url_unique(cur) -> None:
     if cur.fetchone() is not None:
         return
 
-    # Unique index by the expected name?
     cur.execute(
         """
         select 1
@@ -280,250 +394,247 @@ def assert_articles_url_unique(cur) -> None:
     )
 
 
-def assert_tables_exist(cur) -> None:
+def assert_tables_exist(cur, required: Tuple[str, ...]) -> None:
     cur.execute(
         """
         select tablename
         from pg_tables
         where schemaname='public' and tablename = any(%s)
         """,
-        (list(REQUIRED_TABLES),),
+        (list(required),),
     )
     found = {r[0] for r in cur.fetchall()}
-    missing = [t for t in REQUIRED_TABLES if t not in found]
+    missing = [t for t in required if t not in found]
     if missing:
-        raise RuntimeError(
-            f"Missing tables in DB: {missing}. Run your schema/migrations first."
-        )
+        raise RuntimeError(f"Missing tables in DB: {missing}. Run your schema/migrations first.")
 
 
-def load_latest_snapshot_into_db(
-    snap_dir: Path = DEFAULT_SNAP_DIR,
-    input_path: Optional[Path] = None,
-    dry_run: bool = False,
-) -> dict:
+# ---------------------------------------------------------------------------
+# Chunk embedding routine
+# ---------------------------------------------------------------------------
+
+def fetch_riders_for_chunks(conn, only_missing: bool) -> List[Dict[str, Any]]:
+    sql = FETCH_RIDERS_MISSING_CHUNKS_SQL if only_missing else FETCH_RIDERS_FOR_CHUNKS_SQL
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def truncate_rider_chunks(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(TRUNCATE_RIDER_CHUNKS_SQL)
+    conn.commit()
+
+
+def upsert_rider_chunks(
+    conn,
+    records: List[Tuple[int, str, int, str, int, List[float], str]],
+    page_size: int = 500,
+) -> int:
     """
-    Incrementally load the newest cleaned snapshot into Postgres.
-    Returns a small stats dict.
+    records: (rider_id, chunk_kind, chunk_ix, chunk_text, chunk_tokens, embedding, model)
     """
-    path = input_path or find_latest_new_snapshot(snap_dir)
-    articles_in = _load_input(path)
+    if not records:
+        return 0
+    with conn.cursor() as cur:
+        execute_values(cur, UPSERT_RIDER_CHUNKS_SQL, records, page_size=page_size)
+    conn.commit()
+    return len(records)
+
+
+def build_and_embed_chunks(
+    conn,
+    model_name: str,
+    only_missing: bool,
+    batch_size: int,
+    dry_run: bool,
+    max_workers: int = 8,
+) -> Dict[str, Any]:
+    register_vector(conn)
+
+    riders = fetch_riders_for_chunks(conn, only_missing=only_missing)
+
+    # Flatten chunk candidates
+    chunk_rows: List[Tuple[int, str, int, str, int]] = []
+    for r in riders:
+        rider_id = int(r["id"])
+        for c in build_rider_chunks_from_row(r):
+            chunk_rows.append(
+                (
+                    rider_id,
+                    str(c["chunk_kind"]),
+                    int(c["chunk_ix"]),
+                    str(c["chunk_text"]),
+                    int(c["chunk_tokens"]),
+                )
+            )
+
+    if not chunk_rows:
+        return {"riders_considered": len(riders), "chunks_built": 0, "chunks_upserted": 0}
+
+    total_upserted = 0
+
+    for i in range(0, len(chunk_rows), batch_size):
+        batch = chunk_rows[i : i + batch_size]
+        texts = [row[3] for row in batch]
+
+        # Embed (concurrent recommended)
+        vectors = embed_texts_concurrent(texts, max_workers=max_workers)
+
+        if len(vectors) != len(texts):
+            raise RuntimeError(f"Chunk embed count mismatch: {len(vectors)} != {len(texts)}")
+
+        if vectors and len(vectors[0]) != EXPECTED_EMBED_DIM:
+            raise RuntimeError(
+                f"Embedding dimension mismatch: got {len(vectors[0])}, expected {EXPECTED_EMBED_DIM}. "
+                "Update EXPECTED_EMBED_DIM and your DB vector(N)."
+            )
+
+        upsert_records: List[Tuple[int, str, int, str, int, List[float], str]] = []
+        for (row, vec) in zip(batch, vectors):
+            rider_id, chunk_kind, chunk_ix, chunk_text, chunk_tokens = row
+            upsert_records.append(
+                (rider_id, chunk_kind, chunk_ix, chunk_text, chunk_tokens, vec, model_name)
+            )
+
+        if dry_run:
+            continue  # do not write
+
+        total_upserted += upsert_rider_chunks(conn, upsert_records, page_size=500)
+
+    if dry_run:
+        conn.rollback()
+        return {
+            "riders_considered": len(riders),
+            "chunks_built": len(chunk_rows),
+            "chunks_upserted": 0,
+            "dry_run": True,
+        }
+
+    return {
+        "riders_considered": len(riders),
+        "chunks_built": len(chunk_rows),
+        "chunks_upserted": total_upserted,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main load routine (articles + riders)
+# ---------------------------------------------------------------------------
+
+def load_snapshot_incremental(
+    conn,
+    input_path: Path,
+    dry_run: bool,
+) -> Dict[str, Any]:
+    articles_in = _load_input(input_path)
     if not articles_in:
-        return {"snapshot": str(path), "inserted_articles": 0, "inserted_riders": 0, "skipped_no_url": 0}
+        return {"snapshot": str(input_path), "inserted_articles": 0, "inserted_riders": 0, "skipped_no_url": 0}
 
-    normalized_articles = []
+    normalized_articles: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     for a in articles_in:
         na = normalize_article(a)
         if not na["url"]:
             continue
         normalized_articles.append((na, a))
 
-    inserted_articles = 0
-    inserted_riders = 0
     skipped_no_url = len(articles_in) - len(normalized_articles)
 
-    with get_pg_connection(autocommit=False) as conn:
-        with conn.cursor() as cur:
-            assert_tables_exist(cur)
-            assert_articles_url_unique(cur)
+    with conn.cursor() as cur:
+        assert_tables_exist(cur, REQUIRED_TABLES_BASE)
+        assert_articles_url_unique(cur)
 
-            article_rows = [(na["title"], na["url"], na["body"], na["raw"]) for (na, _) in normalized_articles]
-            execute_values(cur, ARTICLE_UPSERT_SQL, article_rows, page_size=200)
-            inserted = cur.fetchall()
-            url_to_article_id = {url: aid for (aid, url) in inserted}
-            inserted_articles = len(url_to_article_id)
+        article_rows = [(na["title"], na["url"], na["body"], na["raw"]) for (na, _) in normalized_articles]
+        execute_values(cur, ARTICLE_UPSERT_SQL, article_rows, page_size=200)
 
-            rider_rows = []
-            for (na, original_article) in normalized_articles:
-                aid = url_to_article_id.get(na["url"])
-                if not aid:
-                    continue
-                for r in extract_riders(original_article):
-                    nr = normalize_rider(r, aid)
-                    rider_rows.append(
-                        (
-                            nr["article_id"], nr["name"], nr["age"], nr["location"], nr["bike"], nr["key_items"],
-                            nr["frame_type"], nr["frame_material"], nr["wheel_size"], nr["tyre_width"],
-                            nr["electronic_shifting"], nr["raw"],
-                        )
+        inserted = cur.fetchall()  
+        url_to_article_id = {url: aid for (aid, url) in inserted}
+        inserted_articles = len(url_to_article_id)
+
+        rider_rows = []
+        for (na, original_article) in normalized_articles:
+            aid = url_to_article_id.get(na["url"])
+            if not aid:
+                continue  
+
+            for r in extract_riders(original_article):
+                nr = normalize_rider(r, aid)
+                rider_rows.append(
+                    (
+                        nr["article_id"], nr["name"], nr["age"], nr["location"], nr["bike"], nr["key_items"],
+                        nr["frame_type"], nr["frame_material"], nr["wheel_size"], nr["tyre_width"],
+                        nr["electronic_shifting"], nr["raw"],
                     )
+                )
 
-            if rider_rows:
-                execute_values(cur, RIDER_INSERT_SQL, rider_rows, page_size=500)
-                inserted_riders = len(rider_rows)
+        inserted_riders = 0
+        if rider_rows:
+            execute_values(cur, RIDER_INSERT_SQL, rider_rows, page_size=500)
+            inserted_riders = len(rider_rows)
 
-            if dry_run:
-                conn.rollback()
-            else:
-                conn.commit()
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
 
     return {
-        "snapshot": str(path),
+        "snapshot": str(input_path),
         "inserted_articles": inserted_articles,
         "inserted_riders": inserted_riders,
         "skipped_no_url": skipped_no_url,
     }
 
-def fetch_riders(conn) -> List[Dict[str, Any]]:
-    """
-    Fetch riders from Postgres as list[dict].
-    This is the source for embedding.
-    """
-    with conn.cursor() as cur:
-        cur.execute(FETCH_RIDERS_SQL)
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
-
-
-def truncate_rider_embeddings(conn) -> None:
-    """
-    Clear rider_embeddings table (for a full rebuild).
-    """
-    with conn.cursor() as cur:
-        cur.execute(TRUNCATE_RIDER_EMBEDDINGS_SQL)
-    conn.commit()
-
-
-
-def fetch_riders_missing_embeddings(conn) -> List[Dict[str, Any]]:
-    with conn.cursor() as cur:
-        cur.execute(FETCH_RIDERS_MISSING_EMB_SQL)
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
-
-
-def upsert_rider_embeddings(
-    conn,
-    records: List[Tuple[int, List[float], str]],
-    page_size: int = 500,
-) -> int:
-    """
-    Upsert embeddings into rider_embeddings in batch.
-
-    Args:
-        conn: psycopg2 connection
-        records: list of (rider_id, embedding_vector, model_name)
-        page_size: batch size for execute_values
-
-    Returns:
-        Number of rows attempted (len(records)).
-    """
-    if not records:
-        return 0
-
-    with conn.cursor() as cur:
-        execute_values(
-            cur,
-            UPSERT_RIDER_EMBEDDINGS_SQL,
-            records,
-            page_size=page_size,
-        )
-    conn.commit()
-    return len(records)
-
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Incrementally load newest cleaned DotWatcher snapshot into DB.")
-    parser.add_argument(
-        "--input",
-        type=str,
-        default="",
-        help="Optional path to a cleaned snapshot (.json or .jsonl). If omitted, loads the latest in data/snapshots/clean.",
-    )
-    parser.add_argument(
-        "--snap-dir",
-        type=str,
-        default=str(DEFAULT_SNAP_DIR),
-        help="Directory where cleaned snapshots live.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Parse and report how many rows would be inserted, but do not write to DB.",
-    )
+    parser = argparse.ArgumentParser(description="Load cleaned DotWatcher snapshot; build+embed rider_chunks.")
+    parser.add_argument("--input", type=str, default="", help="Optional cleaned snapshot (.json/.jsonl).")
+    parser.add_argument("--snap-dir", type=str, default=str(DEFAULT_SNAP_DIR), help="Snapshots directory.")
+    parser.add_argument("--dry-run", action="store_true", help="Rollback everything; print stats only.")
+
+    # Chunk flags
+    parser.add_argument("--with-chunks", action="store_true", help="Build+embed rider_chunks after loading.")
+    parser.add_argument("--only-missing-chunks", action="store_true", help="Only build chunks for riders without chunks.")
+    parser.add_argument("--rebuild-chunks", action="store_true", help="TRUNCATE rider_chunks then rebuild (implies not only-missing).")
+    parser.add_argument("--chunk-batch-size", type=int, default=128, help="Embedding batch size for chunks.")
+
+    # Optional label stored in DB (even though Ollama model is controlled by settings.embedding_model)
+    parser.add_argument("--chunk-embedding-model-name", type=str, default="ollama", help="Label stored in rider_chunks.model.")
     args = parser.parse_args()
 
     snap_dir = Path(args.snap_dir)
     input_path = Path(args.input) if args.input else find_latest_new_snapshot(snap_dir)
-
     print(f"Loading snapshot: {input_path}")
 
-    articles_in = _load_input(input_path)
-    if not articles_in:
-        print("Snapshot is empty. Nothing to load.")
-        return
-
-    # Normalize + filter out missing URLs (cannot dedupe)
-    normalized_articles = []
-    for a in articles_in:
-        na = normalize_article(a)
-        if not na["url"]:
-            continue
-        normalized_articles.append((na, a))  # keep original for rider extraction
-
-    if args.dry_run:
-        print(f"[dry-run] parsed articles with url: {len(normalized_articles)} (out of {len(articles_in)})")
-
-    inserted_articles = 0
-    inserted_riders = 0
-    skipped_no_url = len(articles_in) - len(normalized_articles)
-
     with get_pg_connection(autocommit=False) as conn:
+        # Load articles + riders
+        register_vector(conn)
+        stats = load_snapshot_incremental(conn, input_path=input_path, dry_run=args.dry_run)
+        print(f"Articles+riders stats: {stats}")
+
+        if not args.with_chunks:
+            return
+
+        # Ensure chunk table exists
         with conn.cursor() as cur:
-            assert_tables_exist(cur)
-            assert_articles_url_unique(cur)
-            
+            assert_tables_exist(cur, REQUIRED_TABLES_WITH_CHUNKS)
 
-            # Batch insert articles and capture ids for newly inserted ones only
-            article_rows = [(na["title"], na["url"], na["body"], na["raw"]) for (na, _) in normalized_articles]
-
+        if args.rebuild_chunks:
             if args.dry_run:
-                # We can’t know “new vs existing” without hitting the DB; we still do a rollback.
-                pass
+                print("[dry-run] would TRUNCATE rider_chunks")
+            else:
+                truncate_rider_chunks(conn)
 
-            execute_values(cur, ARTICLE_UPSERT_SQL, article_rows, page_size=200)
-            inserted = cur.fetchall()  # rows returned are ONLY newly inserted due to DO NOTHING
-            url_to_article_id = {url: aid for (aid, url) in inserted}
-            inserted_articles = len(url_to_article_id)
+        only_missing = args.only_missing_chunks and not args.rebuild_chunks
 
-            # Insert riders only for the newly inserted articles
-            rider_rows = []
-            for (na, original_article) in normalized_articles:
-                aid = url_to_article_id.get(na["url"])
-                if not aid:
-                    continue  # existing article -> do not add riders here (incremental load)
-                riders = extract_riders(original_article)
-                for r in riders:
-                    nr = normalize_rider(r, aid)
-                    rider_rows.append(
-                        (
-                            nr["article_id"], nr["name"], nr["age"], nr["location"], nr["bike"], nr["key_items"],
-                            nr["frame_type"], nr["frame_material"], nr["wheel_size"], nr["tyre_width"],
-                            nr["electronic_shifting"], nr["raw"],
-                        )
-                    )
-
-            if rider_rows:
-                execute_values(cur, RIDER_INSERT_SQL, rider_rows, page_size=500)
-                inserted_riders = len(rider_rows)
-
-            if args.dry_run:
-                conn.rollback()
-                print(f"[dry-run] would insert ~{inserted_articles} new articles and ~{inserted_riders} riders")
-                print(f"[dry-run] skipped articles with missing url: {skipped_no_url}")
-                return
-
-            conn.commit()
-
-    print(
-        f"Inserted {inserted_articles} new articles and {inserted_riders} riders. "
-        f"Skipped missing-url: {skipped_no_url}."
-    )
+        chunk_stats = build_and_embed_chunks(
+            conn,
+            model_name=args.chunk_embedding_model_name,
+            only_missing=only_missing,
+            batch_size=max(1, args.chunk_batch_size),
+            dry_run=args.dry_run,
+        )
+        print(f"Chunks stats: {chunk_stats}")
 
 
 if __name__ == "__main__":

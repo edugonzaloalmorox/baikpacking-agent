@@ -5,6 +5,7 @@ from urllib.parse import urlparse
 
 import psycopg2
 from psycopg2.extensions import connection as PGConnection
+from pgvector.psycopg2 import register_vector
 
 try:
     # Optional: load local .env for CLI runs (Docker/CI usually inject env already)
@@ -52,6 +53,7 @@ def get_pg_connection(autocommit: bool = False) -> Iterator[PGConnection]:
     """
     dsn = get_db_dsn()
     conn = psycopg2.connect(dsn)
+    register_vector(conn)
     conn.autocommit = autocommit
     try:
         yield conn
