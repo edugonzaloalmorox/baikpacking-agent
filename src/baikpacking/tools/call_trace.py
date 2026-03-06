@@ -27,13 +27,12 @@ class CallTraceEvent:
 @dataclass
 class CallTrace:
     """
-    Collects tool-call events during an agent run.
+    Collects call events during a run.
 
-    Tools should call:
-      trace.add(tool=..., args=..., result=..., elapsed_ms=...)
-    Runner can serialize:
+    JSON-serializable events are exposed through:
       trace.calls
     """
+
     _events: List[CallTraceEvent] = field(default_factory=list)
 
     def add(self, tool: str, args: Dict[str, Any], result: Any, elapsed_ms: float) -> None:
@@ -44,6 +43,24 @@ class CallTrace:
                 result=result,
                 elapsed_ms=float(elapsed_ms),
             )
+        )
+
+    def record(
+        self,
+        tool: str,
+        *,
+        args: Optional[Dict[str, Any]] = None,
+        result: Any = None,
+        elapsed_ms: Optional[float] = None,
+    ) -> None:
+        """
+        Convenience wrapper for adding a trace event.
+        """
+        self.add(
+            tool=tool,
+            args=args or {},
+            result={} if result is None else result,
+            elapsed_ms=0.0 if elapsed_ms is None else float(elapsed_ms),
         )
 
     def __str__(self) -> str:
@@ -69,9 +86,92 @@ class CallTrace:
         ]
 
 
+def get_call_trace_from_deps(deps: Any) -> Optional[CallTrace]:
+    """
+    Plain Python helper for orchestration code.
+    """
+    return getattr(deps, "call_trace", None) if deps is not None else None
+
+
 def _get_trace(ctx: RunContext) -> Optional[CallTrace]:
     deps = getattr(ctx, "deps", None)
-    return getattr(deps, "call_trace", None)
+    return get_call_trace_from_deps(deps)
+
+
+def record_trace_call(
+    *,
+    deps: Any,
+    tool_name: str,
+    args: Optional[Dict[str, Any]] = None,
+    result: Any = None,
+    elapsed_ms: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Plain Python tracing helper for deterministic orchestration.
+
+    Use this from application code instead of calling the @Tool wrapper.
+    """
+    trace = get_call_trace_from_deps(deps)
+    if trace is not None:
+        try:
+            trace.record(
+                tool=tool_name,
+                args=args or {},
+                result={} if result is None else result,
+                elapsed_ms=elapsed_ms,
+            )
+        except Exception:
+            logger.debug("trace.record failed inside record_trace_call", exc_info=True)
+
+    return {
+        "ok": True,
+        "tool_name": tool_name,
+        "args": args or {},
+        "result": {} if result is None else result,
+        "elapsed_ms": 0.0 if elapsed_ms is None else float(elapsed_ms),
+    }
+
+
+def time_and_record(
+    *,
+    deps: Any,
+    tool_name: str,
+    args: Optional[Dict[str, Any]] = None,
+    fn,
+) -> Any:
+    """
+    Execute a plain Python function, measure elapsed time, and record it.
+
+    Example:
+        result = time_and_record(
+            deps=deps,
+            tool_name="search_similar_riders",
+            args={"query": query, "top_k_riders": 5},
+            fn=lambda: run_search_similar_riders(...),
+        )
+    """
+    t0 = time.perf_counter()
+    result = fn()
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    summary: Any
+    if isinstance(result, dict):
+        summary = result
+    elif isinstance(result, list):
+        summary = {"count": len(result)}
+    elif isinstance(result, str):
+        summary = {"chars": len(result)}
+    else:
+        summary = {"type": type(result).__name__}
+
+    record_trace_call(
+        deps=deps,
+        tool_name=tool_name,
+        args=args or {},
+        result=summary,
+        elapsed_ms=elapsed_ms,
+    )
+    return result
 
 
 @Tool
@@ -83,7 +183,10 @@ def trace_tool_call(
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Lightweight tracing tool the LLM can call to prove the loop is running.
+    Lightweight tracing tool for agent-driven loops.
+
+    For deterministic orchestration in Python, use record_trace_call(...)
+    instead of calling this tool wrapper directly.
     """
     t0 = time.perf_counter()
     payload: Dict[str, Any] = {
@@ -99,7 +202,12 @@ def trace_tool_call(
         try:
             trace.add(
                 tool="trace_tool_call",
-                args={"tool_name": tool_name, "stage": stage, "note": note, "extra": extra or {}},
+                args={
+                    "tool_name": tool_name,
+                    "stage": stage,
+                    "note": note,
+                    "extra": extra or {},
+                },
                 result={"ok": True},
                 elapsed_ms=elapsed_ms,
             )

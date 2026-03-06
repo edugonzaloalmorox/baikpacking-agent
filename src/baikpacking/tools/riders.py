@@ -1,14 +1,11 @@
 import json
 import logging
-import os
 import re
 import time
-from collections import defaultdict
-from typing import Any, DefaultDict, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 from pydantic import ValidationError
 from pydantic_ai import RunContext, Tool
-from psycopg2.extras import RealDictCursor  # works for psycopg2; safe if psycopg3 not used here
 
 from baikpacking.agents.models import SimilarRider
 from baikpacking.tools._trace_utils import trace_tool
@@ -20,6 +17,9 @@ _YEAR_RE = re.compile(r"(19|20)\d{2}")
 
 # Cache table-existence checks per DB URL to avoid repeated checks/warnings.
 _RIDER_CHUNKS_EXISTS: Dict[str, bool] = {}
+
+# Query embedding cache across calls.
+_QUERY_EMB_CACHE: Dict[str, Sequence[float]] = {}
 
 
 # -------------------------
@@ -36,21 +36,19 @@ def _infer_year_from_title(title: Optional[str]) -> Optional[int]:
 
 def _extract_event_hint(query: str, event_keywords: List[str]) -> Optional[str]:
     """Extract an event keyword present in the query (lowercased contains match)."""
-    q = query.lower()
+    q = (query or "").lower()
     for key in event_keywords:
         if key in q:
             return key
     return None
 
 
-def _connect(database_url: str):
-    """
-    Prefer psycopg3; fall back to psycopg2.
+def _norm_q(q: str) -> str:
+    return " ".join((q or "").lower().split())
 
-    Note: This file uses psycopg2 extras (RealDictCursor) for convenience.
-    If you run psycopg3 here, you can remove RealDictCursor usage or implement
-    row->dict conversion manually.
-    """
+
+def _connect(database_url: str):
+    """Prefer psycopg3; fall back to psycopg2."""
     try:
         import psycopg  # type: ignore
         return psycopg.connect(database_url)
@@ -61,17 +59,7 @@ def _connect(database_url: str):
 
 def _vector_text(vec: Sequence[float]) -> str:
     """Format vector for pgvector input (passed as bound param cast to ::vector)."""
-    # Keeping this to avoid needing pgvector adapters in this tool.
     return "[" + ",".join(f"{float(x):.8f}" for x in vec) + "]"
-
-
-def _clip_text(s: Any, max_chars: int = 800) -> Optional[str]:
-    if not isinstance(s, str):
-        return None
-    s = s.strip()
-    if not s:
-        return None
-    return s if len(s) <= max_chars else (s[: max_chars - 1] + "…")
 
 
 def _table_exists(conn, table_name: str) -> bool:
@@ -85,32 +73,139 @@ def _table_exists(conn, table_name: str) -> bool:
         return False
 
 
+def _ensure_chunks_table_known(conn, database_url: str) -> bool:
+    """Memoized check for rider_chunks existence (per DB url)."""
+    exists = _RIDER_CHUNKS_EXISTS.get(database_url)
+    if exists is not None:
+        return exists
+
+    exists = _table_exists(conn, "rider_chunks")
+    _RIDER_CHUNKS_EXISTS[database_url] = exists
+    if not exists:
+        logger.warning("Table public.rider_chunks does not exist; skipping chunk retrieval.")
+    return exists
+
+
 # -------------------------
-# Core DB routines
+# Chunk-first retrieval SQL
 # -------------------------
 
-def _fetch_candidates(
+FETCH_TOP_RIDERS_BY_CHUNKS_SQL = """
+WITH chunk_hits AS (
+  SELECT
+    rc.rider_id,
+    rc.chunk_kind,
+    rc.chunk_ix,
+    rc.chunk_text,
+    (rc.embedding <=> %(qvec)s::vector)::float AS distance
+  FROM public.rider_chunks rc
+  WHERE rc.embedding IS NOT NULL
+  ORDER BY rc.embedding <=> %(qvec)s::vector
+  LIMIT %(top_k_chunks)s
+),
+ranked AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (PARTITION BY rider_id ORDER BY distance ASC) AS rn
+  FROM chunk_hits
+),
+rider_rank AS (
+  SELECT
+    rider_id,
+    MIN(distance) AS best_distance,
+    AVG(distance) AS avg_distance,
+    COUNT(*) AS n_hits
+  FROM chunk_hits
+  GROUP BY rider_id
+),
+top_riders AS (
+  SELECT rider_id, best_distance, avg_distance, n_hits
+  FROM rider_rank
+  ORDER BY best_distance ASC
+  LIMIT %(top_k_riders)s
+)
+SELECT
+  tr.rider_id,
+  tr.best_distance,
+  tr.avg_distance,
+  tr.n_hits,
+  r.chunk_kind,
+  r.chunk_ix,
+  r.chunk_text,
+  r.distance
+FROM top_riders tr
+JOIN ranked r ON r.rider_id = tr.rider_id AND r.rn <= %(max_chunks_per_rider)s
+ORDER BY tr.best_distance ASC, r.distance ASC;
+"""
+
+
+def _fetch_top_riders_by_chunks(
     conn,
     qvec_param: str,
-    limit: int,
-    ef_search: Optional[int],
-) -> List[Tuple[int, float]]:
-    """Return [(rider_id, distance)] from rider_embeddings."""
-    sql = """
-    SELECT
-      rider_id,
-      (embedding <=> %s::vector)::float AS distance
-    FROM rider_embeddings
-    ORDER BY embedding <=> %s::vector
-    LIMIT %s;
+    top_k_riders: int,
+    top_k_chunks: int,
+    max_chunks_per_rider: int,
+) -> Dict[int, Dict[str, Any]]:
     """
-    with conn.cursor() as cur:
-        if ef_search is not None:
-            # This only matters for hnsw; harmless if extension/setting not present.
-            cur.execute("SET LOCAL hnsw.ef_search = %s;", (int(ef_search),))
-        cur.execute(sql, (qvec_param, qvec_param, int(limit)))
-        return [(int(rid), float(dist)) for (rid, dist) in cur.fetchall()]
+    Returns:
+      {
+        rider_id: {
+          rider_id, best_distance, avg_distance, n_hits,
+          chunks: [ {score, text, chunk_kind, chunk_ix}, ... ]
+        }
+      }
+    """
+    rows_by_rider: Dict[int, Dict[str, Any]] = {}
 
+    with conn.cursor() as cur:
+        cur.execute(
+            FETCH_TOP_RIDERS_BY_CHUNKS_SQL,
+            {
+                "qvec": qvec_param,
+                "top_k_chunks": int(top_k_chunks),
+                "top_k_riders": int(top_k_riders),
+                "max_chunks_per_rider": int(max_chunks_per_rider),
+            },
+        )
+
+        for (
+            rider_id,
+            best_distance,
+            avg_distance,
+            n_hits,
+            chunk_kind,
+            chunk_ix,
+            chunk_text,
+            distance,
+        ) in cur.fetchall():
+            rid = int(rider_id)
+            rec = rows_by_rider.get(rid)
+            if rec is None:
+                rec = {
+                    "rider_id": rid,
+                    "best_distance": float(best_distance),
+                    "avg_distance": float(avg_distance),
+                    "n_hits": int(n_hits),
+                    "_order": len(rows_by_rider),
+                    "chunks": [],
+                }
+                rows_by_rider[rid] = rec
+
+            rec["chunks"].append(
+                {
+                    "score": float(1.0 / (1.0 + float(distance))),
+                    "text": chunk_text,
+                    "chunk_kind": chunk_kind,
+                    "chunk_ix": int(chunk_ix),
+                }
+            )
+
+    return rows_by_rider
+
+
+# -------------------------
+# Rider row hydration
+# -------------------------
 
 def _resolve_riders_cols(cur) -> dict:
     """Resolve riders column names to avoid schema drift issues."""
@@ -184,7 +279,7 @@ def _fetch_rider_rows(conn, rider_ids: List[int]) -> Dict[int, Dict[str, Any]]:
           {sel_elec},
           {sel_bike},
           {sel_key_items}
-        FROM riders r
+        FROM public.riders r
         WHERE r.id = ANY(%s::int[]);
         """
 
@@ -225,157 +320,81 @@ def _fetch_rider_rows(conn, rider_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     return out
 
 
-def _ensure_chunks_table_known(conn, database_url: str) -> bool:
-    """Memoized check for rider_chunks existence (per DB url)."""
-    exists = _RIDER_CHUNKS_EXISTS.get(database_url)
-    if exists is not None:
-        return exists
-
-    exists = _table_exists(conn, "rider_chunks")
-    _RIDER_CHUNKS_EXISTS[database_url] = exists
-    if not exists:
-        logger.warning("Table public.rider_chunks does not exist; skipping chunks retrieval.")
-    return exists
-
-
-def _fetch_chunks(
-    conn,
-    database_url: str,
-    rider_ids: List[int],
-    max_chunks_per_rider: int,
-) -> Dict[int, List[Dict[str, Any]]]:
-    """
-    Fetch up to max_chunks_per_rider chunks per rider.
-
-    Returns:
-      { rider_id: [ {"score": float, "text": str, "chunk_kind": str, "chunk_ix": int}, ... ] }
-    """
-    if not rider_ids or max_chunks_per_rider <= 0:
-        return {rid: [] for rid in rider_ids}
-
-    if not _ensure_chunks_table_known(conn, database_url):
-        return {rid: [] for rid in rider_ids}
-
-    # Use window function to cap per rider in SQL (fast + deterministic)
-    sql = """
-    WITH ranked AS (
-      SELECT
-        rider_id,
-        chunk_kind,
-        chunk_ix,
-        chunk_text,
-        chunk_tokens,
-        row_number() OVER (
-          PARTITION BY rider_id
-          ORDER BY chunk_kind, chunk_ix
-        ) AS rn
-      FROM public.rider_chunks
-      WHERE rider_id = ANY(%s::int[])
-    )
-    SELECT rider_id, chunk_kind, chunk_ix, chunk_text, chunk_tokens
-    FROM ranked
-    WHERE rn <= %s
-    ORDER BY rider_id, chunk_kind, chunk_ix;
-    """
-
-    chunks_by_rider: DefaultDict[int, List[Dict[str, Any]]] = defaultdict(list)
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, (rider_ids, int(max_chunks_per_rider)))
-            for rider_id, chunk_kind, chunk_ix, chunk_text, _chunk_tokens in cur.fetchall():
-                rid = int(rider_id)
-                # Simple heuristic score: earlier chunks get slightly higher
-                ix = int(chunk_ix) if chunk_ix is not None else len(chunks_by_rider[rid])
-                score = 1.0 / (1.0 + ix)
-
-                chunks_by_rider[rid].append(
-                    {
-                        "score": float(score),
-                        "text": chunk_text,
-                        "chunk_kind": chunk_kind,
-                        "chunk_ix": ix,
-                    }
-                )
-    except Exception as e:
-        # Don't permanently mark the table as missing; this could be a transient SQL error.
-        logger.warning("Chunks query failed (skipping chunks): %s", e)
-        return {rid: [] for rid in rider_ids}
-
-    # Ensure all requested rider ids exist as keys
-    return {rid: chunks_by_rider.get(rid, []) for rid in rider_ids}
-
-
 # -------------------------
-# Tools
+# Plain implementations
 # -------------------------
 
-@Tool
-def search_similar_riders(
-    ctx: RunContext,
+def run_search_similar_riders(
+    *,
     query: str,
     top_k_riders: int = 5,
-    oversample_factor: int = 10,
+    oversample_factor: int = 10,   # kept for backward compat, not used in chunk-first path
     max_chunks_per_rider: int = 3,
-    ef_search: Optional[int] = None,
+    ef_search: Optional[int] = None,  # kept for backward compat, not used here
+    top_k_chunks: Optional[int] = None,
     debug: bool = False,
+    deps: PgVectorSearchDeps,
+    trace_ctx: Optional[RunContext] = None,
 ) -> List[SimilarRider]:
-    t0 = time.perf_counter()
+    """
+    Plain Python implementation.
 
-    logger.info(
-        "search_similar_riders called",
-        extra={"top_k_riders": top_k_riders, "oversample_factor": oversample_factor},
-    )
+    Safe to call from deterministic orchestration code.
+    """
+    del oversample_factor, ef_search, debug
+
+    t0 = time.perf_counter()
+    logger.info("search_similar_riders called", extra={"top_k_riders": top_k_riders})
 
     if not query or not query.strip():
-        trace_tool(ctx, "search_similar_riders", {"query": query}, {"riders": 0}, t0)
+        if trace_ctx is not None:
+            trace_tool(trace_ctx, "search_similar_riders", {"query": query}, {"riders": 0}, t0)
         return []
 
-    deps: PgVectorSearchDeps = _get_pg_deps(ctx)
+    qkey = _norm_q(query)
+    qvec = _QUERY_EMB_CACHE.get(qkey)
+    if qvec is None:
+        qvec = deps.embed_query(query)
+        if qvec:
+            _QUERY_EMB_CACHE[qkey] = qvec
 
-    qvec = deps.embed_query(query)
     if not qvec:
         logger.warning("search_similar_riders: embed_query returned empty vector.")
-        trace_tool(ctx, "search_similar_riders", {"query": query}, {"riders": 0}, t0)
+        if trace_ctx is not None:
+            trace_tool(trace_ctx, "search_similar_riders", {"query": query}, {"riders": 0}, t0)
         return []
-
-    qvec_param = _vector_text(qvec)
-    candidate_k = max(int(top_k_riders) * int(oversample_factor), int(top_k_riders))
 
     conn = _connect(deps.database_url)
     try:
         with conn:
-            candidates = _fetch_candidates(conn, qvec_param, candidate_k, ef_search)
-            if not candidates:
-                trace_tool(ctx, "search_similar_riders", {"query": query}, {"riders": 0}, t0)
+            if not _ensure_chunks_table_known(conn, deps.database_url):
+                if trace_ctx is not None:
+                    trace_tool(trace_ctx, "search_similar_riders", {"query": query}, {"riders": 0}, t0)
                 return []
 
-            rider_ids = [rid for rid, _dist in candidates]
-            dist_map = {rid: dist for rid, dist in candidates}
+            qvec_param = _vector_text(qvec)
 
-            rider_map = _fetch_rider_rows(conn, rider_ids)
-            chunks_map = _fetch_chunks(
-                conn,
-                database_url=deps.database_url,
-                rider_ids=rider_ids,
-                max_chunks_per_rider=max_chunks_per_rider,
+            resolved_top_k_chunks = (
+                int(top_k_chunks)
+                if top_k_chunks is not None
+                else max(50, int(top_k_riders) * 50)
             )
 
-            # Fallback: synthesize pseudo-chunks from rider fields if no real chunks returned
-            if not any(chunks_map.get(rid) for rid in rider_ids):
-                for rid in rider_ids:
-                    base = rider_map.get(rid) or {}
-                    pseudo: List[Dict[str, Any]] = []
+            chunk_rank = _fetch_top_riders_by_chunks(
+                conn,
+                qvec_param=qvec_param,
+                top_k_riders=int(top_k_riders),
+                top_k_chunks=resolved_top_k_chunks,
+                max_chunks_per_rider=int(max_chunks_per_rider),
+            )
 
-                    bike_txt = _clip_text(base.get("bike"), 800)
-                    if bike_txt:
-                        pseudo.append({"score": 1.0, "text": f"Bike setup: {bike_txt}", "chunk_kind": "bike", "chunk_ix": 0})
+            rider_ids = sorted(chunk_rank.keys(), key=lambda rid: chunk_rank[rid]["best_distance"])
+            if not rider_ids:
+                if trace_ctx is not None:
+                    trace_tool(trace_ctx, "search_similar_riders", {"query": query}, {"riders": 0}, t0)
+                return []
 
-                    key_txt = _clip_text(base.get("key_items"), 800)
-                    if key_txt:
-                        pseudo.append({"score": 0.95, "text": f"Key items: {key_txt}", "chunk_kind": "key_items", "chunk_ix": 0 if not pseudo else 1})
-
-                    chunks_map[rid] = pseudo
+            rider_map = _fetch_rider_rows(conn, rider_ids)
 
         riders: List[SimilarRider] = []
         for rid in rider_ids:
@@ -383,13 +402,19 @@ def search_similar_riders(
             if not base:
                 continue
 
-            dist = dist_map.get(rid)
-            if dist is None:
-                continue
+            best_distance = float(chunk_rank[rid]["best_distance"])
+            best_score = float(1.0 / (1.0 + best_distance))
 
             payload = dict(base)
-            payload["best_score"] = float(1.0 - dist)
-            payload["chunks"] = chunks_map.get(rid, [])
+            payload["best_score"] = best_score
+            payload["chunks"] = [
+                {
+                    "score": float(c["score"]),
+                    "text": c["text"],
+                    "chunk_index": int(c["chunk_ix"]),
+                }
+                for c in chunk_rank[rid]["chunks"]
+            ]
 
             try:
                 rider = SimilarRider(**payload)
@@ -397,20 +422,10 @@ def search_similar_riders(
                 logger.warning("Skipping invalid rider payload for rider_id=%s: %s", rid, e)
                 continue
 
-            if rider.year is None:
-                rider.year = _infer_year_from_title(rider.event_title)
+            if getattr(rider, "year", None) is None:
+                rider.year = _infer_year_from_title(getattr(rider, "event_title", None))
 
             riders.append(rider)
-
-        if not riders:
-            trace_tool(ctx, "search_similar_riders", {"query": query}, {"riders": 0}, t0)
-            return []
-
-        if riders and (debug or os.getenv("BAIKPACKING_DEBUG_RIDERS") == "1"):
-            sample = riders[0].model_dump(exclude_none=True)
-            if isinstance(sample.get("chunks"), list):
-                sample["chunks"] = sample["chunks"][:1]
-            logger.info("sample rider payload: %s", json.dumps(sample, ensure_ascii=False)[:4000])
 
         try:
             from baikpacking.tools.events import EVENT_KEYWORDS
@@ -426,26 +441,28 @@ def search_similar_riders(
             score = r.best_score or 0.0
             return (same_event, year, score)
 
-        final = sorted(riders, key=sort_key, reverse=True)[:top_k_riders]
+        final = sorted(riders, key=sort_key, reverse=True)[: int(top_k_riders)]
 
-        trace_tool(
-            ctx,
-            "search_similar_riders",
-            {
-                "query": query,
-                "top_k_riders": top_k_riders,
-                "oversample_factor": oversample_factor,
-                "max_chunks_per_rider": max_chunks_per_rider,
-                "ef_search": ef_search,
-            },
-            {
-                "riders": len(final),
-                "riders_with_chunks": sum(1 for r in final if r.chunks),
-                "top_rider_ids": [r.rider_id for r in final[:5]],
-            },
-            t0,
-        )
+        if trace_ctx is not None:
+            trace_tool(
+                trace_ctx,
+                "search_similar_riders",
+                {
+                    "query": query,
+                    "top_k_riders": top_k_riders,
+                    "max_chunks_per_rider": max_chunks_per_rider,
+                    "top_k_chunks": resolved_top_k_chunks,
+                },
+                {
+                    "riders": len(final),
+                    "riders_with_chunks": sum(1 for r in final if getattr(r, "chunks", None)),
+                    "top_rider_ids": [r.rider_id for r in final[:5]],
+                },
+                t0,
+            )
+
         return final
+
     finally:
         try:
             conn.close()
@@ -453,8 +470,15 @@ def search_similar_riders(
             pass
 
 
-@Tool
-def render_grounding_riders(ctx: RunContext, riders: List[SimilarRider]) -> str:
+def run_render_grounding_riders(
+    *,
+    riders: List[SimilarRider],
+    trace_ctx: Optional[RunContext] = None,
+) -> str:
+    """
+    Plain Python implementation.
+    Keep this payload reasonably small to reduce LLM latency.
+    """
     t0 = time.perf_counter()
 
     payload = []
@@ -467,5 +491,51 @@ def render_grounding_riders(ctx: RunContext, riders: List[SimilarRider]) -> str:
         )
 
     out = json.dumps(payload, ensure_ascii=False)
-    trace_tool(ctx, "render_grounding_riders", {"riders_len": len(riders)}, {"chars": len(out)}, t0)
+
+    if trace_ctx is not None:
+        trace_tool(trace_ctx, "render_grounding_riders", {"riders_len": len(riders)}, {"chars": len(out)}, t0)
+
     return out
+
+
+# -------------------------
+# Tool wrappers
+# -------------------------
+
+@Tool
+def search_similar_riders(
+    ctx: RunContext,
+    query: str,
+    top_k_riders: int = 5,
+    oversample_factor: int = 10,
+    max_chunks_per_rider: int = 3,
+    ef_search: Optional[int] = None,
+    debug: bool = False,
+    top_k_chunks: Optional[int] = None,
+) -> List[SimilarRider]:
+    """
+    Agent-exposed wrapper around the plain implementation.
+    """
+    deps: PgVectorSearchDeps = _get_pg_deps(ctx)
+    return run_search_similar_riders(
+        query=query,
+        top_k_riders=top_k_riders,
+        oversample_factor=oversample_factor,
+        max_chunks_per_rider=max_chunks_per_rider,
+        ef_search=ef_search,
+        top_k_chunks=top_k_chunks,
+        debug=debug,
+        deps=deps,
+        trace_ctx=ctx,
+    )
+
+
+@Tool
+def render_grounding_riders(ctx: RunContext, riders: List[SimilarRider]) -> str:
+    """
+    Agent-exposed wrapper around the plain implementation.
+    """
+    return run_render_grounding_riders(
+        riders=riders,
+        trace_ctx=ctx,
+    )

@@ -1,19 +1,18 @@
+import hashlib
+import json
 import logging
+import os
 import re
-from typing import Optional, List, Tuple, Dict, Any
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import anyio
 import httpx
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field, model_validator
-from pydantic_ai import Tool, RunContext, Agent
+from pydantic_ai import Agent, RunContext, Tool
 from pydantic_ai.models.openai import OpenAIChatModel
-
-import hashlib
-import json
-import os
-import time
-from pathlib import Path
 
 from baikpacking.db.db_connection import get_pg_connection
 
@@ -23,6 +22,7 @@ except ImportError:
     DDGS = None
 
 logger = logging.getLogger(__name__)
+
 
 # ---------------- Models ----------------
 
@@ -34,9 +34,8 @@ class EventSearchResult(BaseModel):
 
 
 class Evidence(BaseModel):
-    """
-    Evidence from a fetched page (NOT a search engine snippet).
-    """
+    """Evidence from a fetched page (not a search-engine snippet)."""
+
     source_url: str
     snippet: Optional[str] = None
 
@@ -50,23 +49,19 @@ class EventContextSummary(BaseModel):
     - If a numeric field is filled, the corresponding evidence must be provided.
     """
 
-    # Quantitative (only fill if explicitly supported by evidence)
     distance_km: Optional[float] = None
     distance_evidence: Optional[Evidence] = None
 
     total_climbing_m: Optional[int] = None
     climbing_evidence: Optional[Evidence] = None
 
-    # Qualitative (summaries should still come from page text)
     surface: Optional[str] = None
     route_character: Optional[str] = None
     climate_notes: Optional[str] = None
     resupply_notes: Optional[str] = None
 
-    # Hard requirements from official sources (mandatory kit, rules, constraints)
     constraints: List[str] = Field(default_factory=list)
 
-    # Free-text synthesis (must not introduce new facts)
     summary: Optional[str] = None
 
     @model_validator(mode="after")
@@ -87,7 +82,82 @@ class EventWebContext(BaseModel):
     results: List[EventSearchResult] = Field(default_factory=list)
 
 
+# ---------------- Cache helpers ----------------
+
+
+def _has_useful_event_context(value: EventWebContext) -> bool:
+    """
+    Strong-enough result to keep in cache and reuse.
+
+    We accept either:
+    - non-empty structured context, or
+    - search results / URLs that can still provide fallback signal
+    """
+    if value.context is not None:
+        ctx = value.context
+        if any(
+            [
+                ctx.summary,
+                ctx.surface,
+                ctx.route_character,
+                ctx.climate_notes,
+                ctx.resupply_notes,
+                bool(ctx.constraints),
+                ctx.distance_km is not None,
+                ctx.total_climbing_m is not None,
+            ]
+        ):
+            return True
+
+    return bool(value.official_url or value.dotwatcher_url or value.results)
+
+
+def _event_context_to_text(event_context_obj: Any) -> str:
+    """
+    Convert EventWebContext to retrieval-friendly text.
+
+    This is useful when structured context is sparse and we need fallback
+    signal from search results.
+    """
+    if not event_context_obj:
+        return ""
+
+    parts: List[str] = []
+
+    ctx = getattr(event_context_obj, "context", None)
+    if ctx is not None:
+        parts.extend(
+            [
+                ctx.summary or "",
+                ctx.surface or "",
+                ctx.route_character or "",
+                ctx.climate_notes or "",
+                ctx.resupply_notes or "",
+                " ".join(ctx.constraints or []),
+            ]
+        )
+
+    for r in getattr(event_context_obj, "results", [])[:5]:
+        title = getattr(r, "title", None) or ""
+        snippet = getattr(r, "snippet", None) or ""
+        if title:
+            parts.append(title)
+        if snippet:
+            parts.append(snippet)
+
+    official_url = getattr(event_context_obj, "official_url", None)
+    dotwatcher_url = getattr(event_context_obj, "dotwatcher_url", None)
+
+    if official_url:
+        parts.append(str(official_url))
+    if dotwatcher_url:
+        parts.append(str(dotwatcher_url))
+
+    return "\n".join(p.strip() for p in parts if isinstance(p, str) and p.strip())
+
+
 # ---------------- Cache ----------------
+
 
 EVENT_CONTEXT_CACHE_PATH = Path(
     os.getenv("EVENT_CONTEXT_CACHE_PATH", "data/eval/event_context_cache.jsonl")
@@ -96,7 +166,6 @@ EVENT_CONTEXT_CACHE_TTL_S = int(
     os.getenv("EVENT_CONTEXT_CACHE_TTL_S", str(7 * 24 * 3600))
 )
 
-# in-memory: key -> (created_at_epoch, EventWebContext)
 _EVENT_CONTEXT_CACHE: Dict[str, Tuple[float, EventWebContext]] = {}
 _CACHE_LOADED = False
 
@@ -108,11 +177,6 @@ def _event_cache_key(
     context_model: str,
     max_results: int,
 ) -> str:
-    """
-    Stable cache key across runs.
-
-    Include context_model/max_results since they can change chosen URLs and summaries.
-    """
     base = "|".join(
         [
             (title or "").strip().lower(),
@@ -139,8 +203,8 @@ def _load_cache_once() -> None:
                 line = line.strip()
                 if not line:
                     continue
-                d = json.loads(line)
 
+                d = json.loads(line)
                 key = str(d.get("key", "")).strip()
                 created_at = float(d.get("created_at", 0) or 0)
                 value = d.get("value")
@@ -148,12 +212,17 @@ def _load_cache_once() -> None:
                 if not key or not isinstance(value, dict):
                     continue
 
-                # TTL filtering at load time keeps memory clean
                 if created_at and (time.time() - created_at) > EVENT_CONTEXT_CACHE_TTL_S:
                     continue
 
                 ctx = EventWebContext.model_validate(value)
+
+                # Skip weak cached objects so they don't poison future runs.
+                if not _has_useful_event_context(ctx):
+                    continue
+
                 _EVENT_CONTEXT_CACHE[key] = (created_at or time.time(), ctx)
+
     except Exception as exc:
         logger.warning(
             "Failed to load event context cache (%s): %s",
@@ -170,7 +239,10 @@ def _cache_get(key: str) -> Optional[EventWebContext]:
 
     created_at, ctx = item
     if created_at and (time.time() - created_at) > EVENT_CONTEXT_CACHE_TTL_S:
-        # Expired: drop it
+        _EVENT_CONTEXT_CACHE.pop(key, None)
+        return None
+
+    if not _has_useful_event_context(ctx):
         _EVENT_CONTEXT_CACHE.pop(key, None)
         return None
 
@@ -178,6 +250,10 @@ def _cache_get(key: str) -> Optional[EventWebContext]:
 
 
 def _cache_set(key: str, value: EventWebContext) -> None:
+    # Do not persist weak / empty contexts.
+    if not _has_useful_event_context(value):
+        return
+
     created_at = time.time()
     _EVENT_CONTEXT_CACHE[key] = (created_at, value)
 
@@ -200,6 +276,7 @@ def _cache_set(key: str, value: EventWebContext) -> None:
 
 
 # ---------------- Helpers ----------------
+
 
 _TITLE_YEAR_RE = re.compile(r"(19|20)\d{2}")
 _AGGREGATOR_DOMAINS = (
@@ -246,7 +323,14 @@ def _is_social(url: str) -> bool:
     d = _domain(url)
     return any(
         bad in d
-        for bad in ("facebook.com", "instagram.com", "twitter.com", "x.com", "youtube.com", "tiktok.com")
+        for bad in (
+            "facebook.com",
+            "instagram.com",
+            "twitter.com",
+            "x.com",
+            "youtube.com",
+            "tiktok.com",
+        )
     )
 
 
@@ -264,7 +348,6 @@ def _join_url(base: str, path: str) -> str:
 
 
 def _base_site(url: str) -> str:
-    # https://a.b/c/d -> https://a.b
     m = re.match(r"^(https?://[^/]+)", url)
     return m.group(1) if m else url
 
@@ -318,13 +401,9 @@ async def _fetch_page_text(url: str, timeout: int = 10, max_chars: int = 12000) 
 
 async def _pick_official_url_with_llm(
     event_title: str,
-    candidates: List[Tuple[str, str]],  # (url, page_text)
+    candidates: List[Tuple[str, str]],
     model_name: str,
 ) -> Optional[str]:
-    """
-    Ask an LLM to choose which candidate is most likely the official event website,
-    based on the page text.
-    """
     model = OpenAIChatModel(model_name)
 
     class PickResult(BaseModel):
@@ -337,7 +416,7 @@ async def _pick_official_url_with_llm(
         system_prompt=(
             "Select the official event website URL.\n"
             "Use only evidence in the provided page texts.\n"
-            "Prefer pages containing: registration, rules, route, GPX, FAQ, checkpoints, mandatory kit.\n"
+            "Prefer pages containing registration, rules, route, GPX, FAQ, checkpoints, or mandatory kit.\n"
             "Avoid aggregators and calendar listings unless no official site exists.\n"
             "Return JSON."
         ),
@@ -357,26 +436,19 @@ async def _guess_urls_and_context(
     results: List[EventSearchResult],
     context_model: str,
 ) -> Tuple[Optional[str], Optional[str], Optional[EventContextSummary]]:
-    """
-    Returns (official_url, dotwatcher_url, context_summary).
-
-    Strategy:
-    - Find dotwatcher url if present.
-    - Prefer non-social, non-dotwatcher, non-aggregator candidates for official selection.
-    - If none, allow aggregators as a fallback.
-    - Summarize from an official rules-like page if possible; else from official homepage; else dotwatcher.
-    """
     dotwatcher_url = next((r.url for r in results if _looks_like_dotwatcher(r.url)), None)
 
     primary_candidates = [
-        r for r in results
+        r
+        for r in results
         if not _is_social(r.url)
         and not _looks_like_dotwatcher(r.url)
         and not _is_aggregator(r.url)
     ]
 
     fallback_candidates = [
-        r for r in results
+        r
+        for r in results
         if not _is_social(r.url)
         and not _looks_like_dotwatcher(r.url)
     ]
@@ -392,21 +464,22 @@ async def _guess_urls_and_context(
 
     official_url: Optional[str] = None
     if fetched:
-        official_url = await _pick_official_url_with_llm(event_title, fetched, model_name=context_model)
+        official_url = await _pick_official_url_with_llm(
+            event_title,
+            fetched,
+            model_name=context_model,
+        )
 
-    # Choose best page to summarize
     context_url = official_url or dotwatcher_url
     context_summary: Optional[EventContextSummary] = None
 
     if context_url:
-        # If we have an official site, try "rules-ish" pages too (often contain the real details)
         candidate_pages: List[str] = [context_url]
 
         if official_url:
             base = _base_site(official_url)
             candidate_pages.extend(_join_url(base, p) for p in _COMMON_RULE_PATHS)
 
-        # Fetch first page that gives useful text
         page_text: Optional[str] = None
         chosen_url: Optional[str] = None
         for u in candidate_pages:
@@ -440,9 +513,9 @@ async def _summarise_event_context_from_text(
 
     system_prompt = (
         "Extract structured context for an ultra-distance cycling event.\n"
-        "Only use facts supported by the provided page text; otherwise leave null/empty.\n"
-        "Do NOT invent exact numbers.\n"
-        "If you fill distance_km or total_climbing_m, you MUST also fill the corresponding evidence field\n"
+        "Only use facts supported by the provided page text; otherwise leave null or empty.\n"
+        "Do not invent exact numbers.\n"
+        "If you fill distance_km or total_climbing_m, you must also fill the corresponding evidence field "
         f"with source_url='{source_url}' and a short verbatim snippet from the page text.\n"
         "Return JSON matching EventContextSummary."
     )
@@ -458,29 +531,24 @@ async def _summarise_event_context_from_text(
     return result.output
 
 
-# ---------------- Tool ----------------
+# ---------------- Plain implementation ----------------
 
 
-@Tool
-async def event_web_search(
-    ctx: RunContext,
+async def run_event_web_search(
+    *,
     article_id: Optional[int] = None,
     event_title: Optional[str] = None,
     event_url: Optional[str] = None,
     max_results: int = 8,
     context_model: str = "gpt-4o-mini",
+    deps: Any = None,
 ) -> EventWebContext:
     """
-    Fetch event context with robust inputs:
-    - prefer article_id (DB-backed)
-    - else event_title
-    - if event_url is provided, try fetching it directly first (more accurate than web search)
-
-    Added:
-    - caching (disk + in-memory) with TTL
+    Plain async implementation for deterministic orchestration.
     """
-    # Normalize inputs
-    title: Optional[str] = None
+    del deps  # reserved for future use
+
+    title: Optional[str]
     if article_id is not None:
         title = get_article_title(article_id) or event_title
     else:
@@ -489,7 +557,6 @@ async def event_web_search(
     title = (title or "").strip() or None
     event_url = (event_url or "").strip() or None
 
-    # Cache key (works even when title is None)
     cache_key = _event_cache_key(
         title=title or "",
         event_url=event_url,
@@ -501,7 +568,6 @@ async def event_web_search(
     if cached is not None:
         return cached
 
-    # If we have an explicit URL, try to summarize it directly first
     if event_url:
         page_text = await _fetch_page_text(event_url)
         if page_text:
@@ -521,31 +587,91 @@ async def event_web_search(
             )
             _cache_set(cache_key, out)
             return out
-        # If fetch failed, fall back to search using title (if available)
 
     if not title:
-        logger.warning("event_web_search called without usable identifier (no title, no fetchable URL).")
-        out = EventWebContext(event_title="[unknown event]", search_query="")
-        _cache_set(cache_key, out)
-        return out
+        logger.warning("run_event_web_search called without usable identifier.")
+        return EventWebContext(event_title="[unknown event]", search_query="")
 
     title_for_search = _strip_year(title)
-    base_query = f"{title_for_search} official site rules route registration"
-    results = await _search_on_web(base_query, max_results=max_results)
+
+    queries = [
+        f"{title_for_search} official site rules route registration",
+        f"{title_for_search} bikepacking race route terrain",
+    ]
+
+    merged_results: List[EventSearchResult] = []
+    seen_urls = set()
+
+    for q in queries:
+        rows = await _search_on_web(q, max_results=max_results)
+        for r in rows:
+            if r.url in seen_urls:
+                continue
+            seen_urls.add(r.url)
+            merged_results.append(r)
 
     official_url, dotwatcher_url, context_summary = await _guess_urls_and_context(
         event_title=title,
-        results=results,
+        results=merged_results,
         context_model=context_model,
     )
 
     out = EventWebContext(
         event_title=title,
-        search_query=base_query,
+        search_query=queries[0],
         official_url=official_url,
         dotwatcher_url=dotwatcher_url,
         context=context_summary,
-        results=results,
+        results=merged_results,
     )
     _cache_set(cache_key, out)
     return out
+
+
+def run_event_web_search_sync(
+    *,
+    article_id: Optional[int] = None,
+    event_title: Optional[str] = None,
+    event_url: Optional[str] = None,
+    max_results: int = 8,
+    context_model: str = "gpt-4o-mini",
+    deps: Any = None,
+) -> EventWebContext:
+    """
+    Sync wrapper for deterministic orchestration code.
+    """
+    return anyio.run(
+        lambda: run_event_web_search(
+            article_id=article_id,
+            event_title=event_title,
+            event_url=event_url,
+            max_results=max_results,
+            context_model=context_model,
+            deps=deps,
+        )
+    )
+
+
+# ---------------- Tool wrapper ----------------
+
+
+@Tool
+async def event_web_search(
+    ctx: RunContext,
+    article_id: Optional[int] = None,
+    event_title: Optional[str] = None,
+    event_url: Optional[str] = None,
+    max_results: int = 8,
+    context_model: str = "gpt-4o-mini",
+) -> EventWebContext:
+    """
+    Agent-exposed wrapper around the plain implementation.
+    """
+    return await run_event_web_search(
+        article_id=article_id,
+        event_title=event_title,
+        event_url=event_url,
+        max_results=max_results,
+        context_model=context_model,
+        deps=getattr(ctx, "deps", None),
+    )
