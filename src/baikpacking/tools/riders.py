@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import time
+import logfire
 from typing import Any, Dict, List, Optional, Sequence
 
 from pydantic import ValidationError
@@ -328,9 +329,9 @@ def run_search_similar_riders(
     *,
     query: str,
     top_k_riders: int = 5,
-    oversample_factor: int = 10,   # kept for backward compat, not used in chunk-first path
+    oversample_factor: int = 10,
     max_chunks_per_rider: int = 3,
-    ef_search: Optional[int] = None,  # kept for backward compat, not used here
+    ef_search: Optional[int] = None,
     top_k_chunks: Optional[int] = None,
     debug: bool = False,
     deps: PgVectorSearchDeps,
@@ -344,130 +345,186 @@ def run_search_similar_riders(
     del oversample_factor, ef_search, debug
 
     t0 = time.perf_counter()
-    logger.info("search_similar_riders called", extra={"top_k_riders": top_k_riders})
 
-    if not query or not query.strip():
-        if trace_ctx is not None:
-            trace_tool(trace_ctx, "search_similar_riders", {"query": query}, {"riders": 0}, t0)
-        return []
+    with logfire.span(
+        "tool.search_similar_riders",
+        query=query,
+        top_k_riders=top_k_riders,
+        max_chunks_per_rider=max_chunks_per_rider,
+        top_k_chunks=top_k_chunks,
+    ):
+        logger.info("search_similar_riders called", extra={"top_k_riders": top_k_riders})
 
-    qkey = _norm_q(query)
-    qvec = _QUERY_EMB_CACHE.get(qkey)
-    if qvec is None:
-        qvec = deps.embed_query(query)
-        if qvec:
-            _QUERY_EMB_CACHE[qkey] = qvec
-
-    if not qvec:
-        logger.warning("search_similar_riders: embed_query returned empty vector.")
-        if trace_ctx is not None:
-            trace_tool(trace_ctx, "search_similar_riders", {"query": query}, {"riders": 0}, t0)
-        return []
-
-    conn = _connect(deps.database_url)
-    try:
-        with conn:
-            if not _ensure_chunks_table_known(conn, deps.database_url):
+        with logfire.span("tool.search_similar_riders.validate_query"):
+            if not query or not query.strip():
                 if trace_ctx is not None:
                     trace_tool(trace_ctx, "search_similar_riders", {"query": query}, {"riders": 0}, t0)
                 return []
 
-            qvec_param = _vector_text(qvec)
+        qkey = _norm_q(query)
 
-            resolved_top_k_chunks = (
-                int(top_k_chunks)
-                if top_k_chunks is not None
-                else max(50, int(top_k_riders) * 50)
-            )
+        with logfire.span("tool.search_similar_riders.embedding_cache_lookup", query_key=qkey):
+            qvec = _QUERY_EMB_CACHE.get(qkey)
 
-            chunk_rank = _fetch_top_riders_by_chunks(
-                conn,
-                qvec_param=qvec_param,
-                top_k_riders=int(top_k_riders),
-                top_k_chunks=resolved_top_k_chunks,
-                max_chunks_per_rider=int(max_chunks_per_rider),
-            )
+        if qvec is None:
+            with logfire.span("tool.search_similar_riders.embed_query"):
+                qvec = deps.embed_query(query)
+                if qvec:
+                    _QUERY_EMB_CACHE[qkey] = qvec
 
-            rider_ids = sorted(chunk_rank.keys(), key=lambda rid: chunk_rank[rid]["best_distance"])
-            if not rider_ids:
-                if trace_ctx is not None:
-                    trace_tool(trace_ctx, "search_similar_riders", {"query": query}, {"riders": 0}, t0)
-                return []
+        if not qvec:
+            logfire.warn("embed_query returned empty vector", query=query)
+            logger.warning("search_similar_riders: embed_query returned empty vector.")
+            if trace_ctx is not None:
+                trace_tool(trace_ctx, "search_similar_riders", {"query": query}, {"riders": 0}, t0)
+            return []
 
-            rider_map = _fetch_rider_rows(conn, rider_ids)
-
-        riders: List[SimilarRider] = []
-        for rid in rider_ids:
-            base = rider_map.get(rid)
-            if not base:
-                continue
-
-            best_distance = float(chunk_rank[rid]["best_distance"])
-            best_score = float(1.0 / (1.0 + best_distance))
-
-            payload = dict(base)
-            payload["best_score"] = best_score
-            payload["chunks"] = [
-                {
-                    "score": float(c["score"]),
-                    "text": c["text"],
-                    "chunk_index": int(c["chunk_ix"]),
-                }
-                for c in chunk_rank[rid]["chunks"]
-            ]
-
-            try:
-                rider = SimilarRider(**payload)
-            except ValidationError as e:
-                logger.warning("Skipping invalid rider payload for rider_id=%s: %s", rid, e)
-                continue
-
-            if getattr(rider, "year", None) is None:
-                rider.year = _infer_year_from_title(getattr(rider, "event_title", None))
-
-            riders.append(rider)
+        with logfire.span("tool.search_similar_riders.connect_db"):
+            conn = _connect(deps.database_url)
 
         try:
-            from baikpacking.tools.events import EVENT_KEYWORDS
-        except Exception:
-            EVENT_KEYWORDS = []
+            with conn:
+                with logfire.span("tool.search_similar_riders.ensure_chunks_table"):
+                    if not _ensure_chunks_table_known(conn, deps.database_url):
+                        if trace_ctx is not None:
+                            trace_tool(trace_ctx, "search_similar_riders", {"query": query}, {"riders": 0}, t0)
+                        return []
 
-        event_hint = _extract_event_hint(query, EVENT_KEYWORDS)
+                qvec_param = _vector_text(qvec)
 
-        def sort_key(r: SimilarRider):
-            title_lower = (r.event_title or "").lower()
-            same_event = 1 if (event_hint and event_hint in title_lower) else 0
-            year = r.year or 0
-            score = r.best_score or 0.0
-            return (same_event, year, score)
+                resolved_top_k_chunks = (
+                    int(top_k_chunks)
+                    if top_k_chunks is not None
+                    else max(50, int(top_k_riders) * 50)
+                )
 
-        final = sorted(riders, key=sort_key, reverse=True)[: int(top_k_riders)]
+                with logfire.span(
+                    "tool.search_similar_riders.fetch_top_riders_by_chunks",
+                    resolved_top_k_chunks=resolved_top_k_chunks,
+                ):
+                    chunk_rank = _fetch_top_riders_by_chunks(
+                        conn,
+                        qvec_param=qvec_param,
+                        top_k_riders=int(top_k_riders),
+                        top_k_chunks=resolved_top_k_chunks,
+                        max_chunks_per_rider=int(max_chunks_per_rider),
+                    )
 
-        if trace_ctx is not None:
-            trace_tool(
-                trace_ctx,
-                "search_similar_riders",
-                {
-                    "query": query,
-                    "top_k_riders": top_k_riders,
-                    "max_chunks_per_rider": max_chunks_per_rider,
-                    "top_k_chunks": resolved_top_k_chunks,
-                },
-                {
-                    "riders": len(final),
-                    "riders_with_chunks": sum(1 for r in final if getattr(r, "chunks", None)),
-                    "top_rider_ids": [r.rider_id for r in final[:5]],
-                },
-                t0,
+                with logfire.span("tool.search_similar_riders.extract_rider_ids"):
+                    rider_ids = sorted(
+                        chunk_rank.keys(),
+                        key=lambda rid: chunk_rank[rid]["best_distance"],
+                    )
+
+                if not rider_ids:
+                    if trace_ctx is not None:
+                        trace_tool(trace_ctx, "search_similar_riders", {"query": query}, {"riders": 0}, t0)
+                    return []
+
+                with logfire.span(
+                    "tool.search_similar_riders.fetch_rider_rows",
+                    rider_count=len(rider_ids),
+                ):
+                    rider_map = _fetch_rider_rows(conn, rider_ids)
+
+            with logfire.span(
+                "tool.search_similar_riders.build_similar_riders",
+                rider_count=len(rider_ids),
+            ):
+                riders: List[SimilarRider] = []
+                invalid_payloads = 0
+
+                for rid in rider_ids:
+                    base = rider_map.get(rid)
+                    if not base:
+                        continue
+
+                    best_distance = float(chunk_rank[rid]["best_distance"])
+                    best_score = float(1.0 / (1.0 + best_distance))
+
+                    payload = dict(base)
+                    payload["best_score"] = best_score
+                    payload["chunks"] = [
+                        {
+                            "score": float(c["score"]),
+                            "text": c["text"],
+                            "chunk_index": int(c["chunk_ix"]),
+                        }
+                        for c in chunk_rank[rid]["chunks"]
+                    ]
+
+                    try:
+                        rider = SimilarRider(**payload)
+                    except ValidationError as e:
+                        invalid_payloads += 1
+                        logger.warning("Skipping invalid rider payload for rider_id=%s: %s", rid, e)
+                        continue
+
+                    if getattr(rider, "year", None) is None:
+                        rider.year = _infer_year_from_title(getattr(rider, "event_title", None))
+
+                    riders.append(rider)
+
+                logfire.info(
+                    "built similar riders",
+                    rider_count=len(riders),
+                    invalid_payloads=invalid_payloads,
+                )
+
+            with logfire.span("tool.search_similar_riders.extract_event_hint"):
+                try:
+                    from baikpacking.tools.events import EVENT_KEYWORDS
+                except Exception:
+                    EVENT_KEYWORDS = []
+
+                event_hint = _extract_event_hint(query, EVENT_KEYWORDS)
+
+            with logfire.span(
+                "tool.search_similar_riders.sort_and_trim",
+                event_hint=event_hint,
+            ):
+                def sort_key(r: SimilarRider):
+                    title_lower = (r.event_title or "").lower()
+                    same_event = 1 if (event_hint and event_hint in title_lower) else 0
+                    year = r.year or 0
+                    score = r.best_score or 0.0
+                    return (same_event, year, score)
+
+                final = sorted(riders, key=sort_key, reverse=True)[: int(top_k_riders)]
+
+            logfire.info(
+                "search_similar_riders completed",
+                returned_riders=len(final),
+                riders_with_chunks=sum(1 for r in final if getattr(r, "chunks", None)),
+                top_rider_ids=[r.rider_id for r in final[:5]],
             )
 
-        return final
+            if trace_ctx is not None:
+                trace_tool(
+                    trace_ctx,
+                    "search_similar_riders",
+                    {
+                        "query": query,
+                        "top_k_riders": top_k_riders,
+                        "max_chunks_per_rider": max_chunks_per_rider,
+                        "top_k_chunks": resolved_top_k_chunks,
+                    },
+                    {
+                        "riders": len(final),
+                        "riders_with_chunks": sum(1 for r in final if getattr(r, "chunks", None)),
+                        "top_rider_ids": [r.rider_id for r in final[:5]],
+                    },
+                    t0,
+                )
 
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+            return final
+
+        finally:
+            with logfire.span("tool.search_similar_riders.close_db_connection"):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
 
 def run_render_grounding_riders(

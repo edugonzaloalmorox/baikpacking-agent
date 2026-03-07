@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import time
+import logfire
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -548,84 +549,152 @@ async def run_event_web_search(
     """
     del deps  # reserved for future use
 
-    title: Optional[str]
-    if article_id is not None:
-        title = get_article_title(article_id) or event_title
-    else:
-        title = event_title
-
-    title = (title or "").strip() or None
-    event_url = (event_url or "").strip() or None
-
-    cache_key = _event_cache_key(
-        title=title or "",
+    with logfire.span(
+        "tool.event_web_search",
+        article_id=article_id,
+        event_title=event_title,
         event_url=event_url,
-        context_model=context_model,
         max_results=max_results,
-    )
-
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
-
-    if event_url:
-        page_text = await _fetch_page_text(event_url)
-        if page_text:
-            ctx_summary = await _summarise_event_context_from_text(
-                event_title=title or event_url,
-                page_text=page_text,
-                source_url=event_url,
-                model_name=context_model,
-            )
-            out = EventWebContext(
-                event_title=title or event_url,
-                search_query="",
-                official_url=None if _looks_like_dotwatcher(event_url) else event_url,
-                dotwatcher_url=event_url if _looks_like_dotwatcher(event_url) else None,
-                context=ctx_summary,
-                results=[],
-            )
-            _cache_set(cache_key, out)
-            return out
-
-    if not title:
-        logger.warning("run_event_web_search called without usable identifier.")
-        return EventWebContext(event_title="[unknown event]", search_query="")
-
-    title_for_search = _strip_year(title)
-
-    queries = [
-        f"{title_for_search} official site rules route registration",
-        f"{title_for_search} bikepacking race route terrain",
-    ]
-
-    merged_results: List[EventSearchResult] = []
-    seen_urls = set()
-
-    for q in queries:
-        rows = await _search_on_web(q, max_results=max_results)
-        for r in rows:
-            if r.url in seen_urls:
-                continue
-            seen_urls.add(r.url)
-            merged_results.append(r)
-
-    official_url, dotwatcher_url, context_summary = await _guess_urls_and_context(
-        event_title=title,
-        results=merged_results,
         context_model=context_model,
-    )
+    ):
+        with logfire.span("tool.event_web_search.resolve_title"):
+            title: Optional[str]
+            if article_id is not None:
+                title = get_article_title(article_id) or event_title
+            else:
+                title = event_title
 
-    out = EventWebContext(
-        event_title=title,
-        search_query=queries[0],
-        official_url=official_url,
-        dotwatcher_url=dotwatcher_url,
-        context=context_summary,
-        results=merged_results,
-    )
-    _cache_set(cache_key, out)
-    return out
+            title = (title or "").strip() or None
+            event_url = (event_url or "").strip() or None
+
+        with logfire.span("tool.event_web_search.build_cache_key"):
+            cache_key = _event_cache_key(
+                title=title or "",
+                event_url=event_url,
+                context_model=context_model,
+                max_results=max_results,
+            )
+
+        with logfire.span("tool.event_web_search.cache_lookup"):
+            cached = _cache_get(cache_key)
+
+        if cached is not None:
+            logfire.info(
+                "event_web_search cache hit",
+                event_title=title,
+                event_url=event_url,
+            )
+            return cached
+
+        if event_url:
+            with logfire.span("tool.event_web_search.fetch_page_text", source_url=event_url):
+                page_text = await _fetch_page_text(event_url)
+
+            if page_text:
+                with logfire.span(
+                    "tool.event_web_search.summarise_page_text",
+                    source_url=event_url,
+                    text_length=len(page_text),
+                ):
+                    ctx_summary = await _summarise_event_context_from_text(
+                        event_title=title or event_url,
+                        page_text=page_text,
+                        source_url=event_url,
+                        model_name=context_model,
+                    )
+
+                with logfire.span("tool.event_web_search.build_output_from_direct_url"):
+                    out = EventWebContext(
+                        event_title=title or event_url,
+                        search_query="",
+                        official_url=None if _looks_like_dotwatcher(event_url) else event_url,
+                        dotwatcher_url=event_url if _looks_like_dotwatcher(event_url) else None,
+                        context=ctx_summary,
+                        results=[],
+                    )
+
+                with logfire.span("tool.event_web_search.cache_set_direct_url"):
+                    _cache_set(cache_key, out)
+
+                logfire.info(
+                    "event_web_search completed from direct url",
+                    event_title=title or event_url,
+                    source_url=event_url,
+                    results_count=0,
+                )
+                return out
+
+        if not title:
+            logger.warning("run_event_web_search called without usable identifier.")
+            logfire.warn("event_web_search missing usable identifier")
+            return EventWebContext(event_title="[unknown event]", search_query="")
+
+        with logfire.span("tool.event_web_search.strip_year"):
+            title_for_search = _strip_year(title)
+
+        with logfire.span("tool.event_web_search.build_queries"):
+            queries = [
+                f"{title_for_search} official site rules route registration",
+                f"{title_for_search} bikepacking race route terrain",
+            ]
+
+        merged_results: List[EventSearchResult] = []
+        seen_urls = set()
+
+        with logfire.span(
+            "tool.event_web_search.search_queries",
+            query_count=len(queries),
+        ):
+            for idx, q in enumerate(queries, start=1):
+                with logfire.span(
+                    "tool.event_web_search.search_single_query",
+                    query=q,
+                    query_index=idx,
+                ):
+                    rows = await _search_on_web(q, max_results=max_results)
+
+                with logfire.span(
+                    "tool.event_web_search.merge_results",
+                    query=q,
+                    raw_results=len(rows),
+                ):
+                    for r in rows:
+                        if r.url in seen_urls:
+                            continue
+                        seen_urls.add(r.url)
+                        merged_results.append(r)
+
+        with logfire.span(
+            "tool.event_web_search.guess_urls_and_context",
+            merged_results_count=len(merged_results),
+        ):
+            official_url, dotwatcher_url, context_summary = await _guess_urls_and_context(
+                event_title=title,
+                results=merged_results,
+                context_model=context_model,
+            )
+
+        with logfire.span("tool.event_web_search.build_output"):
+            out = EventWebContext(
+                event_title=title,
+                search_query=queries[0],
+                official_url=official_url,
+                dotwatcher_url=dotwatcher_url,
+                context=context_summary,
+                results=merged_results,
+            )
+
+        with logfire.span("tool.event_web_search.cache_set"):
+            _cache_set(cache_key, out)
+
+        logfire.info(
+            "event_web_search completed",
+            event_title=title,
+            results_count=len(merged_results),
+            official_url=official_url,
+            dotwatcher_url=dotwatcher_url,
+        )
+        return out
 
 
 def run_event_web_search_sync(
@@ -640,16 +709,24 @@ def run_event_web_search_sync(
     """
     Sync wrapper for deterministic orchestration code.
     """
-    return anyio.run(
-        lambda: run_event_web_search(
-            article_id=article_id,
-            event_title=event_title,
-            event_url=event_url,
-            max_results=max_results,
-            context_model=context_model,
-            deps=deps,
+    with logfire.span(
+        "tool.event_web_search_sync",
+        article_id=article_id,
+        event_title=event_title,
+        event_url=event_url,
+        max_results=max_results,
+        context_model=context_model,
+    ):
+        return anyio.run(
+            lambda: run_event_web_search(
+                article_id=article_id,
+                event_title=event_title,
+                event_url=event_url,
+                max_results=max_results,
+                context_model=context_model,
+                deps=deps,
+            )
         )
-    )
 
 
 # ---------------- Tool wrapper ----------------

@@ -3,6 +3,7 @@ import re
 import json
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
+import logfire
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -549,99 +550,66 @@ def _event_context_to_text(event_context_obj: Any) -> str:
 # -------------------------------------------------------------------
 
 def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, CallTrace]:
-    trace = CallTrace()
-    deps = _build_deps(call_trace=trace)
+    with logfire.span("recommender.run", user_query=user_query):
+    
+        trace = CallTrace()
+        deps = _build_deps(call_trace=trace)
 
-    event_name = _extract_event_name(user_query)
+        event_name = _extract_event_name(user_query)
 
-    # 1) Deterministic event context fetch
-    event_context_obj = time_and_record(
-        deps=deps,
-        tool_name="event_web_search",
-        args={"event_title": event_name},
-        fn=lambda: run_event_web_search_sync(
-            event_title=event_name,
+        # 1) Deterministic event context fetch
+        event_context_obj = time_and_record(
             deps=deps,
-        ),
-    )
+            tool_name="event_web_search",
+            args={"event_title": event_name},
+            fn=lambda: run_event_web_search_sync(
+                event_title=event_name,
+                deps=deps,
+            ),
+        )
 
-    event_context_text = _event_context_to_text(event_context_obj)
+        event_context_text = _event_context_to_text(event_context_obj)
 
-    # 2) Deterministic descriptor query build
-    descriptor = _build_descriptor_query(
-        event_name=event_name,
-        event_context=event_context_text,
-        user_question=user_query,
-    )
+        # 2) Deterministic descriptor query build
+        descriptor = _build_descriptor_query(
+            event_name=event_name,
+            event_context=event_context_text,
+            user_question=user_query,
+        )
 
-    # 3) Small planner call
-    planner_input = {
-    "user_query": user_query,
-    "event_name": event_name,
-    "event_context": event_context_text[:2000],
-    "archetype": descriptor["archetype"],
-    "surface_family": descriptor["surface_family"],
-    "descriptor_query": descriptor["descriptor_query"],
-    "descriptor_query_with_intent": descriptor["descriptor_query_with_intent"],
-}
-    plan = planner_agent.run_sync(str(planner_input)).output
+        # 3) Small planner call
+        planner_input = {
+        "user_query": user_query,
+        "event_name": event_name,
+        "event_context": event_context_text[:2000],
+        "archetype": descriptor["archetype"],
+        "surface_family": descriptor["surface_family"],
+        "descriptor_query": descriptor["descriptor_query"],
+        "descriptor_query_with_intent": descriptor["descriptor_query_with_intent"],
+    }
+        plan = planner_agent.run_sync(str(planner_input)).output
 
-    
-    print("\n--- EVENT CONTEXT TEXT ---")
-    print(event_context_text)
+        
+        print("\n--- EVENT CONTEXT TEXT ---")
+        print(event_context_text)
 
-    print("\n--- DESCRIPTOR FEATURES ---")
-    print(json.dumps(descriptor["features"], indent=2, ensure_ascii=False))
+        print("\n--- DESCRIPTOR FEATURES ---")
+        print(json.dumps(descriptor["features"], indent=2, ensure_ascii=False))
 
-    print("\n--- DESCRIPTOR QUERY ---")
-    print(descriptor["descriptor_query"])
-    
+        print("\n--- DESCRIPTOR QUERY ---")
+        print(descriptor["descriptor_query"])
+        
 
-    
-    # 4) Retrieval tool call
-    retrieval_query = descriptor["descriptor_query"]
-
-    record_trace_call(
-        deps=deps,
-        tool_name="search_similar_riders_attempt",
-        args={
-            "attempt": 1,
-            "query": retrieval_query,
-            "top_k_riders": plan.top_k_riders,
-            "max_chunks_per_rider": plan.max_chunks_per_rider,
-            "top_k_chunks": plan.top_k_chunks,
-        },
-        result={"ok": True},
-        elapsed_ms=0.0,
-    )
-
-    riders = time_and_record(
-    deps=deps,
-    tool_name="search_similar_riders",
-    args={
-        "query": retrieval_query,
-        "top_k_riders": plan.top_k_riders,
-        "max_chunks_per_rider": plan.max_chunks_per_rider,
-        "top_k_chunks": plan.top_k_chunks,
-    },
-    fn=lambda: run_search_similar_riders(
-        query=retrieval_query,
-        top_k_riders=plan.top_k_riders,
-        max_chunks_per_rider=plan.max_chunks_per_rider,
-        top_k_chunks=plan.top_k_chunks,
-        deps=deps,
-    ),
-)
-
-    if (not riders or len(riders) < 3) and plan.include_intent_query:
-        fallback_query = descriptor["descriptor_query_with_intent"]
+        
+        # 4) Retrieval tool call
+        retrieval_query = descriptor["descriptor_query"]
 
         record_trace_call(
             deps=deps,
             tool_name="search_similar_riders_attempt",
             args={
-                "attempt": 2,
-                "query": fallback_query,
+                "attempt": 1,
+                "query": retrieval_query,
                 "top_k_riders": plan.top_k_riders,
                 "max_chunks_per_rider": plan.max_chunks_per_rider,
                 "top_k_chunks": plan.top_k_chunks,
@@ -651,59 +619,94 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
         )
 
         riders = time_and_record(
-            deps=deps,
-            tool_name="search_similar_riders",
-            args={
-                "query": fallback_query,
-                "top_k_riders": plan.top_k_riders,
-                "max_chunks_per_rider": plan.max_chunks_per_rider,
-                "top_k_chunks": plan.top_k_chunks,
-            },
-            fn=lambda: run_search_similar_riders(
-                query=fallback_query,
-                top_k_riders=plan.top_k_riders,
-                max_chunks_per_rider=plan.max_chunks_per_rider,
-                top_k_chunks=plan.top_k_chunks,
-                deps=deps,
-            ),
-        )
-        retrieval_query = fallback_query
-
-    if not riders:
-        raise RuntimeError("No similar riders returned; cannot produce grounded recommendation.")
-
-    compact_riders = _compact_riders(riders)
-
-    # 5) Final writer call
-    writer_input = WriterInput(
-        user_query=user_query,
-        event_name=event_name,
-        event_context=event_context_text[:2500],
-        descriptor_query=retrieval_query,
-        similar_riders=compact_riders,
-    )
-
-    rec = writer_agent.run_sync(writer_input.model_dump_json(indent=2)).output
-
-    # Keep exact retrieved rider content as final grounding source
-    rec.similar_riders = riders
-
-    record_trace_call(
         deps=deps,
-        tool_name="loop",
-        args={"stage": "stop", "note": "deterministic orchestration complete"},
-        result={
-            "event_name": event_name,
-            "retrieval_query": retrieval_query,
-            "riders": len(riders),
+        tool_name="search_similar_riders",
+        args={
+            "query": retrieval_query,
+            "top_k_riders": plan.top_k_riders,
+            "max_chunks_per_rider": plan.max_chunks_per_rider,
+            "top_k_chunks": plan.top_k_chunks,
         },
-        elapsed_ms=0.0,
+        fn=lambda: run_search_similar_riders(
+            query=retrieval_query,
+            top_k_riders=plan.top_k_riders,
+            max_chunks_per_rider=plan.max_chunks_per_rider,
+            top_k_chunks=plan.top_k_chunks,
+            deps=deps,
+        ),
     )
 
-    if not rec.event or not rec.event.strip():
-        rec.event = event_name
+        if (not riders or len(riders) < 3) and plan.include_intent_query:
+            fallback_query = descriptor["descriptor_query_with_intent"]
 
-    return _postprocess_recommendation(rec), trace
+            record_trace_call(
+                deps=deps,
+                tool_name="search_similar_riders_attempt",
+                args={
+                    "attempt": 2,
+                    "query": fallback_query,
+                    "top_k_riders": plan.top_k_riders,
+                    "max_chunks_per_rider": plan.max_chunks_per_rider,
+                    "top_k_chunks": plan.top_k_chunks,
+                },
+                result={"ok": True},
+                elapsed_ms=0.0,
+            )
+
+            riders = time_and_record(
+                deps=deps,
+                tool_name="search_similar_riders",
+                args={
+                    "query": fallback_query,
+                    "top_k_riders": plan.top_k_riders,
+                    "max_chunks_per_rider": plan.max_chunks_per_rider,
+                    "top_k_chunks": plan.top_k_chunks,
+                },
+                fn=lambda: run_search_similar_riders(
+                    query=fallback_query,
+                    top_k_riders=plan.top_k_riders,
+                    max_chunks_per_rider=plan.max_chunks_per_rider,
+                    top_k_chunks=plan.top_k_chunks,
+                    deps=deps,
+                ),
+            )
+            retrieval_query = fallback_query
+
+        if not riders:
+            raise RuntimeError("No similar riders returned; cannot produce grounded recommendation.")
+
+        compact_riders = _compact_riders(riders)
+
+        # 5) Final writer call
+        writer_input = WriterInput(
+            user_query=user_query,
+            event_name=event_name,
+            event_context=event_context_text[:2500],
+            descriptor_query=retrieval_query,
+            similar_riders=compact_riders,
+        )
+
+        rec = writer_agent.run_sync(writer_input.model_dump_json(indent=2)).output
+
+        # Keep exact retrieved rider content as final grounding source
+        rec.similar_riders = riders
+
+        record_trace_call(
+            deps=deps,
+            tool_name="loop",
+            args={"stage": "stop", "note": "deterministic orchestration complete"},
+            result={
+                "event_name": event_name,
+                "retrieval_query": retrieval_query,
+                "riders": len(riders),
+            },
+            elapsed_ms=0.0,
+        )
+
+        if not rec.event or not rec.event.strip():
+            rec.event = event_name
+
+        return _postprocess_recommendation(rec), trace
 
 
 def recommend_setup(user_query: str) -> SetupRecommendation:

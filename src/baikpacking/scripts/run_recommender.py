@@ -109,6 +109,7 @@ def main() -> None:
     # -------------------------
     # Console output
     # -------------------------
+    
     print("\n====================")
     print("BIKEPACKING SETUP")
     print("====================\n")
