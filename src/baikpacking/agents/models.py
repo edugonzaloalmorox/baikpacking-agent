@@ -12,6 +12,20 @@ class ChunkInfo(BaseModel):
     chunk_index: Optional[int] = None
 
 
+class QueryIntent(BaseModel):
+    component: str = "full_setup"
+    confidence: float = 0.0
+    component_terms: List[str] = Field(default_factory=list)
+    asks_for_recommendation: bool = True
+
+
+class RetrievalIntentBundle(BaseModel):
+    intent: QueryIntent
+    broad_query: str
+    component_query: Optional[str] = None
+    include_component_query: bool = False
+
+
 class SimilarRider(BaseModel):
     rider_id: int
     article_id: Optional[int] = None
