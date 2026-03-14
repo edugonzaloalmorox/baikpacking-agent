@@ -1,24 +1,22 @@
 import os
 import re
-import json
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
-import logfire
 
+import logfire
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic_ai import Agent
-
 from pydantic_ai.models.openai import OpenAIChatModel
 
 from baikpacking.agents.models import SetupRecommendation, QueryIntent, RetrievalIntentBundle
 from baikpacking.embedding import embed_text
 from baikpacking.logging_config import setup_logging
 from baikpacking.tools.call_trace import CallTrace, record_trace_call, time_and_record
+from baikpacking.tools.event_context import run_event_web_search_sync
 from baikpacking.tools.pg_vector_search import PgVectorSearchDeps
 from baikpacking.tools.riders import run_search_similar_riders
-from baikpacking.tools.event_context import run_event_web_search_sync
 
 load_dotenv()
 setup_logging()
@@ -27,7 +25,6 @@ setup_logging()
 class AgentSettings(BaseSettings):
     """Settings for the bikepacking recommender agent."""
 
-    planner_model: str = "gpt-4o-mini"
     writer_model: str = "gpt-4o-mini"
 
     model_config = SettingsConfigDict(
@@ -38,6 +35,10 @@ class AgentSettings(BaseSettings):
 
 
 settings = AgentSettings()
+
+DEFAULT_TOP_K_RIDERS = 5
+DEFAULT_MAX_CHUNKS_PER_RIDER = 2
+DEFAULT_TOP_K_CHUNKS = 80
 
 _YEAR_RE = re.compile(r"(19|20)\d{2}")
 _KM_RE = re.compile(r"(\d{2,4})\s*km\b", re.IGNORECASE)
@@ -50,10 +51,6 @@ _EVENT_FRAGMENT_RE = re.compile(
     r"\b(?:official|website|site|rules|route|registration|terrain|weather|setup|gear)\b.*$",
     re.IGNORECASE,
 )
-
-# -------------------------------------------------------------------
-# Event name extraction
-# -------------------------------------------------------------------
 
 KNOWN_EVENTS: Dict[str, str] = {
     "atlas mountain race": "Atlas Mountain Race",
@@ -169,10 +166,6 @@ _EVENT_HINTS: Dict[str, List[str]] = {
     ],
 }
 
-# -------------------------------------------------------------------
-# Descriptor / archetype constants
-# -------------------------------------------------------------------
-
 _ARCHETYPE_ADJACENCY: Dict[str, List[str]] = {
     "mountain_gravel_ultra": ["gravel_ultra", "mountain_offroad_ultra"],
     "gravel_ultra": ["mountain_gravel_ultra", "offroad_bikepacking_ultra"],
@@ -192,10 +185,11 @@ _COMPONENT_PATTERNS: Dict[str, List[str]] = {
     ],
     "tyres": [
         "tyre", "tyres", "tire", "tires", "tubeless", "casing", "width", "2.2", "2.35",
+        "continental", "gp5000", "maxxis", "ardent", "nobby nic", "schwalbe", "g-one",
     ],
     "bags": [
         "bag", "bags", "frame bag", "seat pack", "handlebar roll", "cargo",
-        "apidura", "tailfin", "ortlieb", "restrap",
+        "apidura", "tailfin", "ortlieb", "restrap", "geosmina",
     ],
     "sleep_system": [
         "sleep", "sleep system", "bivy", "bivvy", "quilt", "sleeping bag", "mat", "pad",
@@ -208,7 +202,7 @@ _COMPONENT_PATTERNS: Dict[str, List[str]] = {
         "wheel", "wheels", "rim", "rims", "hub", "hubs", "wheelset",
     ],
     "bike_type": [
-        "bike", "bike type", "frame", "hardtail", "gravel bike", "mtb", "mountain bike",
+        "bike", "bike type", "frame", "hardtail", "gravel bike", "mtb", "mountain bike", "road", "custom build",
     ],
 }
 
@@ -222,9 +216,6 @@ _COMPONENT_QUERY_PHRASES: Dict[str, str] = {
     "bike_type": "bike type, frame, platform, gravel bike, mtb, hardtail",
 }
 
-# -------------------------------------------------------------------
-# Shared helpers
-# -------------------------------------------------------------------
 
 def _append_unique(items: List[str], value: Optional[str]) -> None:
     if not value:
@@ -244,11 +235,6 @@ def _count_titleish_words(words: List[str]) -> int:
         for word in words
         if word.lower() not in _EVENT_CONNECTORS and _TITLEISH_TOKEN_RE.match(word)
     )
-
-
-# -------------------------------------------------------------------
-# Event extraction helpers
-# -------------------------------------------------------------------
 
 def _clean_event_candidate(text: str) -> str:
     candidate = re.sub(r"\s+", " ", (text or "").strip(" \t\r\n?.,:;!()[]{}\"'"))
@@ -362,6 +348,16 @@ def _extract_event_name(user_query: str) -> str:
     normalized = [KNOWN_EVENTS.get(candidate.lower(), candidate) for candidate in candidates]
     return max(normalized, key=_score_event_candidate)
 
+def _query_surface_hint(user_query: str) -> Optional[str]:
+    q = f" {(user_query or '').lower()} "
+    if " road " in q or " all-road " in q or " all road " in q:
+        return "road"
+    if " gravel " in q:
+        return "gravel"
+    if " trail " in q or " mtb " in q or " mountain bike " in q:
+        return "trail"
+    return None
+
 
 def _is_valid_event_name(event_name: Optional[str]) -> bool:
     if not event_name:
@@ -386,10 +382,6 @@ def _event_hint_descriptors(event_name: Optional[str]) -> List[str]:
         return []
     return _EVENT_HINTS.get(event_name.strip().lower(), [])
 
-
-# -------------------------------------------------------------------
-# Output helpers
-# -------------------------------------------------------------------
 
 def _infer_year_from_title(title: Optional[str]) -> Optional[int]:
     if not title:
@@ -431,10 +423,6 @@ def _postprocess_recommendation(rec: SetupRecommendation) -> SetupRecommendation
     )
     return rec
 
-
-# -------------------------------------------------------------------
-# Deterministic descriptor logic
-# -------------------------------------------------------------------
 
 def infer_event_archetype(flags: Dict[str, bool]) -> Dict[str, Any]:
     terrain: List[str] = []
@@ -579,6 +567,19 @@ def _build_descriptor_query(
     if _is_valid_event_name(event_name):
         _append_unique(descriptors, event_name.strip())
 
+    surface_hint = _query_surface_hint(user_question)
+    if surface_hint == "road":
+        _append_unique(descriptors, "road event")
+        _append_unique(descriptors, "road-oriented setup")
+        _append_unique(descriptors, "faster rolling tyres")
+        _append_unique(descriptors, "avoid MTB-style tyre widths")
+    elif surface_hint == "gravel":
+        _append_unique(descriptors, "gravel event")
+        _append_unique(descriptors, "gravel-oriented setup")
+    elif surface_hint == "trail":
+        _append_unique(descriptors, "trail event")
+        _append_unique(descriptors, "trail-oriented setup")
+
     for hint in _event_hint_descriptors(event_name):
         _append_unique(descriptors, hint)
 
@@ -610,6 +611,7 @@ def _build_descriptor_query(
             "archetype_info": archetype_info,
             "event_name_used": _is_valid_event_name(event_name),
             "event_hints_used": _event_hint_descriptors(event_name),
+            "surface_hint": surface_hint,
         },
     }
 
@@ -658,7 +660,9 @@ def _build_retrieval_intent_bundle(
             include_component_query=False,
         )
 
-    component_query = f"{broad_query}. Focus: {_COMPONENT_QUERY_PHRASES.get(intent.component, intent.component)}"
+    component_query = (
+        f"{broad_query}. Focus: {_COMPONENT_QUERY_PHRASES.get(intent.component, intent.component)}"
+    )
 
     return RetrievalIntentBundle(
         intent=intent,
@@ -666,18 +670,6 @@ def _build_retrieval_intent_bundle(
         component_query=component_query,
         include_component_query=True,
     )
-
-# -------------------------------------------------------------------
-# Planner / writer schemas
-# -------------------------------------------------------------------
-
-class RetrievalPlan(BaseModel):
-    event_name: str
-    retrieval_query: str
-    include_intent_query: bool = False
-    top_k_riders: int = 5
-    max_chunks_per_rider: int = 2
-    top_k_chunks: int = 80
 
 
 class CompactChunk(BaseModel):
@@ -710,25 +702,6 @@ class WriterInput(BaseModel):
     similar_riders: List[CompactRider]
 
 
-PLANNER_PROMPT = """
-You build a retrieval plan for a bikepacking recommender.
-
-Return only a RetrievalPlan.
-
-Rules:
-- Keep the retrieval broad enough to find similar events.
-- Prefer event characteristics over exact event-name matching.
-- query_component tells you whether the question is about a specific component.
-- For component-specific questions, the first retrieval should stay broad enough to find analogous events.
-- Use the intent-focused query only as a fallback or refinement.
-- Keep retrieval small and fast.
-- Defaults should be:
-  - top_k_riders = 5
-  - max_chunks_per_rider = 2
-  - top_k_chunks = 80
-""".strip()
-
-
 WRITER_PROMPT = """
 You are a bikepacking equipment and ultra-distance cycling expert.
 
@@ -753,16 +726,7 @@ Output rules:
 - recommended_setup should contain as many grounded fields as possible without guessing
 """.strip()
 
-
-
-planner_model = OpenAIChatModel(settings.planner_model)
 writer_model = OpenAIChatModel(settings.writer_model)
-
-planner_agent = Agent(
-    model=planner_model,
-    output_type=RetrievalPlan,
-    system_prompt=PLANNER_PROMPT,
-)
 
 writer_agent = Agent(
     model=writer_model,
@@ -770,10 +734,6 @@ writer_agent = Agent(
     system_prompt=WRITER_PROMPT,
 )
 
-
-# -------------------------------------------------------------------
-# Dependencies
-# -------------------------------------------------------------------
 
 def _build_deps(call_trace: Optional[CallTrace] = None) -> PgVectorSearchDeps:
     database_url = os.getenv("DATABASE_URL")
@@ -786,10 +746,6 @@ def _build_deps(call_trace: Optional[CallTrace] = None) -> PgVectorSearchDeps:
         call_trace=call_trace,
     )
 
-
-# -------------------------------------------------------------------
-# Grounding compaction
-# -------------------------------------------------------------------
 
 def _compact_riders(riders: List[Any]) -> List[CompactRider]:
     out: List[CompactRider] = []
@@ -847,6 +803,7 @@ def _event_context_to_text(event_context_obj: Any) -> str:
     ]
     return "\n".join(p for p in parts if p)
 
+
 def _rider_component_hit_count(riders: List[Any], component_terms: List[str]) -> int:
     if not riders or not component_terms:
         return 0
@@ -885,13 +842,8 @@ def _rider_component_hit_count(riders: List[Any], component_terms: List[str]) ->
     return hits
 
 
-# -------------------------------------------------------------------
-# Main orchestration
-# -------------------------------------------------------------------
-
 def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, CallTrace]:
     with logfire.span("recommender.run", user_query=user_query):
-
         trace = CallTrace()
         deps = _build_deps(call_trace=trace)
 
@@ -906,7 +858,6 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
             elapsed_ms=0.0,
         )
 
-        # 1) Deterministic event context fetch
         event_context_obj = time_and_record(
             deps=deps,
             tool_name="event_web_search",
@@ -919,7 +870,6 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
 
         event_context_text = _event_context_to_text(event_context_obj)
 
-        # 2) Deterministic descriptor query build
         descriptor = _build_descriptor_query(
             event_name=event_name,
             event_context=event_context_text,
@@ -931,39 +881,16 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
             intent=intent,
         )
 
-        planner_input = {
-            "user_query": user_query,
-            "event_name": event_name,
-            "event_context": event_context_text[:2000],
-            "archetype": descriptor["archetype"],
-            "surface_family": descriptor["surface_family"],
-            "descriptor_query": retrieval_bundle.broad_query,
-            "component_query": retrieval_bundle.component_query,
-            "query_component": intent.component,
-            "intent_confidence": intent.confidence,
-        }
-
-        if intent.component == "full_setup":
-            plan = planner_agent.run_sync(str(planner_input)).output
-        else:
-            plan = RetrievalPlan(
-                event_name=event_name,
-                retrieval_query=first_query,
-                include_intent_query=False,
-                top_k_riders=5,
-                max_chunks_per_rider=2,
-                top_k_chunks=80,
-            )
-
-        # Routing:
-        # - component-specific question -> first try component query, then broad fallback
-        # - full setup question -> first try broad query, then optional intent fallback
         if intent.component != "full_setup" and retrieval_bundle.component_query:
             first_query = retrieval_bundle.component_query
             second_query = retrieval_bundle.broad_query
         else:
             first_query = retrieval_bundle.broad_query
             second_query = retrieval_bundle.component_query
+
+        top_k_riders = DEFAULT_TOP_K_RIDERS
+        max_chunks_per_rider = DEFAULT_MAX_CHUNKS_PER_RIDER
+        top_k_chunks = DEFAULT_TOP_K_CHUNKS
 
         retrieval_query = first_query
 
@@ -974,9 +901,9 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
                 "attempt": 1,
                 "query": retrieval_query,
                 "query_component": intent.component,
-                "top_k_riders": plan.top_k_riders,
-                "max_chunks_per_rider": plan.max_chunks_per_rider,
-                "top_k_chunks": plan.top_k_chunks,
+                "top_k_riders": top_k_riders,
+                "max_chunks_per_rider": max_chunks_per_rider,
+                "top_k_chunks": top_k_chunks,
             },
             result={"ok": True},
             elapsed_ms=0.0,
@@ -988,15 +915,18 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
             args={
                 "query": retrieval_query,
                 "query_component": intent.component,
-                "top_k_riders": plan.top_k_riders,
-                "max_chunks_per_rider": plan.max_chunks_per_rider,
-                "top_k_chunks": plan.top_k_chunks,
+                "component_terms": intent.component_terms,
+                "top_k_riders": top_k_riders,
+                "max_chunks_per_rider": max_chunks_per_rider,
+                "top_k_chunks": top_k_chunks,
             },
             fn=lambda: run_search_similar_riders(
                 query=retrieval_query,
-                top_k_riders=plan.top_k_riders,
-                max_chunks_per_rider=plan.max_chunks_per_rider,
-                top_k_chunks=plan.top_k_chunks,
+                query_component=intent.component,
+                component_terms=intent.component_terms,
+                top_k_riders=top_k_riders,
+                max_chunks_per_rider=max_chunks_per_rider,
+                top_k_chunks=top_k_chunks,
                 deps=deps,
             ),
         )
@@ -1036,9 +966,9 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
                     "attempt": 2,
                     "query": fallback_query,
                     "query_component": intent.component,
-                    "top_k_riders": plan.top_k_riders,
-                    "max_chunks_per_rider": plan.max_chunks_per_rider,
-                    "top_k_chunks": plan.top_k_chunks,
+                    "top_k_riders": top_k_riders,
+                    "max_chunks_per_rider": max_chunks_per_rider,
+                    "top_k_chunks": top_k_chunks,
                 },
                 result={"ok": True},
                 elapsed_ms=0.0,
@@ -1050,15 +980,18 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
                 args={
                     "query": fallback_query,
                     "query_component": intent.component,
-                    "top_k_riders": plan.top_k_riders,
-                    "max_chunks_per_rider": plan.max_chunks_per_rider,
-                    "top_k_chunks": plan.top_k_chunks,
+                    "component_terms": intent.component_terms,
+                    "top_k_riders": top_k_riders,
+                    "max_chunks_per_rider": max_chunks_per_rider,
+                    "top_k_chunks": top_k_chunks,
                 },
                 fn=lambda: run_search_similar_riders(
                     query=fallback_query,
-                    top_k_riders=plan.top_k_riders,
-                    max_chunks_per_rider=plan.max_chunks_per_rider,
-                    top_k_chunks=plan.top_k_chunks,
+                    query_component=intent.component,
+                    component_terms=intent.component_terms,
+                    top_k_riders=top_k_riders,
+                    max_chunks_per_rider=max_chunks_per_rider,
+                    top_k_chunks=top_k_chunks,
                     deps=deps,
                 ),
             )
@@ -1068,7 +1001,6 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
                 intent.component_terms,
             )
 
-            # Prefer the fallback if it improves evidence, or if the first pass was empty/too small
             if (
                 not riders
                 or len(riders) < 3

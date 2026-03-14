@@ -12,6 +12,25 @@ def fmt_score(x):
     return f"{x:.3f}" if isinstance(x, (int, float)) else "NA"
 
 
+def _safe_text(value, fallback: str) -> str:
+    if value is None:
+        return fallback
+    text = str(value).strip()
+    text = text.lstrip(":-–—• \t")
+    text = text.strip()
+    return text if text else fallback
+
+
+def _fmt_grounding_rider(r) -> str:
+    name = _safe_text(getattr(r, "name", None), "Unknown rider")
+    event_title = _safe_text(getattr(r, "event_title", None), "Unknown event")
+    year = getattr(r, "year", None)
+    score = getattr(r, "best_score", None)
+
+    year_text = year if year is not None else "?"
+    return f"- {name} @ {event_title} (year={year_text}, score={fmt_score(score)})"
+
+
 def _get_trace_entries(trace):
     """
     Support both naming conventions:
@@ -40,7 +59,7 @@ def _missing_setup_fields(rs):
 
 
 def main() -> None:
-    query = "What lights should I use for the Atlas Mountain Race?"
+    query = 'What tyres should I use for GranGuanche 2024 road if I want to finish comfortably?'
     rec, trace = recommend_setup_with_trace(query)
 
     rs = rec.recommended_setup
@@ -65,10 +84,7 @@ def main() -> None:
     log_lines.append("Grounding riders:" if rec.similar_riders else "No grounding riders returned")
 
     for r in rec.similar_riders or []:
-        log_lines.append(
-            f"- {r.name or 'Unknown'} @ {r.event_title or 'Unknown event'} "
-            f"(year={r.year}, score={fmt_score(r.best_score)})"
-        )
+        log_lines.append(_fmt_grounding_rider(r))
 
     if rec.reasoning:
         log_lines.append("\nReasoning:")
@@ -109,7 +125,7 @@ def main() -> None:
     # -------------------------
     # Console output
     # -------------------------
-    
+
     print("\n====================")
     print("BIKEPACKING SETUP")
     print("====================\n")
@@ -136,10 +152,7 @@ def main() -> None:
         print("  (no riders returned)")
     else:
         for r in rec.similar_riders:
-            print(
-                f"  - {r.name or 'Unknown'} @ {r.event_title or 'Unknown event'} "
-                f"(year={r.year}, score={fmt_score(r.best_score)})"
-            )
+            print(f"  {_fmt_grounding_rider(r)}")
 
     if rec.reasoning:
         print("\nREASONING:")
