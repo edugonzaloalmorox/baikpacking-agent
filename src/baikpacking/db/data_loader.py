@@ -19,11 +19,7 @@ DEFAULT_SNAP_DIR = Path("data/snapshots/clean")
 DEFAULT_PATTERN_JSON = "dotwatcher_bikes_cleaned_new_*.json"
 DEFAULT_PATTERN_JSONL = "dotwatcher_bikes_cleaned_new_*.jsonl"
 
-# If Ollama embeddings model returns 1024 dims (current default check in embed.py),
-# keep this in sync with DB vector(N) and embed dimension checks.
 EXPECTED_EMBED_DIM = 1024
-
-# Chunk packing controls (simple & deterministic)
 KEY_ITEMS_CHUNK_MAX_CHARS = 280
 
 # ---------------------------------------------------------------------------
@@ -58,11 +54,11 @@ def find_latest_new_snapshot(snap_dir: Path) -> Path:
             f"Expected {DEFAULT_PATTERN_JSON} or {DEFAULT_PATTERN_JSONL}"
         )
 
-    def sort_key(p: Path) -> Tuple[int, float]:
-        ts = _extract_ts(p)
+    def sort_key(path: Path) -> Tuple[int, float]:
+        ts = _extract_ts(path)
         if ts is not None:
             return (1, ts)
-        return (0, p.stat().st_mtime)
+        return (0, path.stat().st_mtime)
 
     return sorted(files, key=sort_key, reverse=True)[0]
 
@@ -86,10 +82,6 @@ def _load_input(path: Path) -> List[Dict[str, Any]]:
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # Accept:
-    # - list[article]
-    # - {"articles":[...]}
-    # - dict single article
     if isinstance(data, dict) and "articles" in data and isinstance(data["articles"], list):
         return data["articles"]
     if isinstance(data, dict):
@@ -104,8 +96,8 @@ def _load_input(path: Path) -> List[Dict[str, Any]]:
 # Chunking helpers (based on riders.bike + riders.key_items)
 # ---------------------------------------------------------------------------
 
-def _norm_str(x: Any) -> str:
-    return "" if x is None else str(x).strip()
+def _norm_str(value: Any) -> str:
+    return "" if value is None else str(value).strip()
 
 
 _SPLIT_RE = re.compile(r"(?:\n+|•|\u2022|- |\t|;|,|\|)+")
@@ -131,12 +123,12 @@ def split_key_items_to_phrases(key_items: Any) -> List[str]:
     raw_parts = [p.strip() for p in _SPLIT_RE.split(s) if p and p.strip()]
     seen = set()
     out = []
-    for p in raw_parts:
-        k = p.lower()
+    for part in raw_parts:
+        k = part.lower()
         if k in seen:
             continue
         seen.add(k)
-        out.append(p)
+        out.append(part)
     return out
 
 
@@ -146,15 +138,15 @@ def pack_phrases_into_chunks(phrases: List[str], max_chars: int) -> List[str]:
     buf: List[str] = []
     size = 0
 
-    for p in phrases:
-        add_len = len(p) + (2 if buf else 0)  # "; "
+    for phrase in phrases:
+        add_len = len(phrase) + (2 if buf else 0)
         if buf and (size + add_len) > max_chars:
             chunks.append("; ".join(buf))
-            buf = [p]
-            size = len(p)
+            buf = [phrase]
+            size = len(phrase)
         else:
-            size = size + add_len if buf else len(p)
-            buf.append(p)
+            size = size + add_len if buf else len(phrase)
+            buf.append(phrase)
 
     if buf:
         chunks.append("; ".join(buf))
@@ -170,29 +162,28 @@ def estimate_tokens_rough(text: str) -> int:
     return max(1, len(t) // 4)
 
 
-def build_rider_chunks_from_row(r: Dict[str, Any]) -> List[Dict[str, Any]]:
+def build_rider_chunks_from_row(rider: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Create chunk rows from riders.bike and riders.key_items.
     Returns list of dicts: chunk_kind, chunk_ix, chunk_text, chunk_tokens
     """
     out: List[Dict[str, Any]] = []
 
-    bike = _norm_str(r.get("bike"))
-    key_items = r.get("key_items")
+    bike = _norm_str(rider.get("bike"))
+    key_items = rider.get("key_items")
 
     if bike:
-        # Keep chunk grounded in "bike" column but enrich with a few structured fields
         extra_bits: List[str] = []
-        for k, label in [
+        for key, label in [
             ("frame_type", "frame_type"),
             ("frame_material", "frame_material"),
             ("wheel_size", "wheel_size"),
             ("tyre_width", "tyre_width"),
             ("electronic_shifting", "electronic_shifting"),
         ]:
-            v = r.get(k)
-            if v is not None and str(v).strip():
-                extra_bits.append(f"{label}={str(v).strip()}")
+            value = rider.get(key)
+            if value is not None and str(value).strip():
+                extra_bits.append(f"{label}={str(value).strip()}")
 
         bike_text = f"Bike: {bike}" + (f" ({', '.join(extra_bits)})" if extra_bits else "")
         out.append(
@@ -246,9 +237,9 @@ def normalize_article(article: Dict[str, Any]) -> Dict[str, Any]:
 
 def normalize_rider(rider: Dict[str, Any], article_id: int) -> Dict[str, Any]:
     def g(*keys: str) -> Any:
-        for k in keys:
-            if k in rider and rider[k] is not None:
-                return rider[k]
+        for key in keys:
+            if key in rider and rider[key] is not None:
+                return rider[key]
         return None
 
     return {
@@ -276,6 +267,21 @@ def extract_riders(article: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
+def fetch_article_ids_by_url(cur, urls: List[str]) -> Dict[str, int]:
+    if not urls:
+        return {}
+
+    cur.execute(
+        """
+        SELECT id, url
+        FROM public.articles
+        WHERE url = ANY(%s);
+        """,
+        (urls,),
+    )
+    return {url: int(article_id) for article_id, url in cur.fetchall()}
+
+
 # ---------------------------------------------------------------------------
 # SQL
 # ---------------------------------------------------------------------------
@@ -283,8 +289,11 @@ def extract_riders(article: Dict[str, Any]) -> List[Dict[str, Any]]:
 ARTICLE_UPSERT_SQL = """
 INSERT INTO articles (title, url, body, raw)
 VALUES %s
-ON CONFLICT DO NOTHING
-RETURNING id, url;
+ON CONFLICT (url) DO UPDATE
+SET
+  title = EXCLUDED.title,
+  body = EXCLUDED.body,
+  raw = EXCLUDED.raw;
 """
 
 RIDER_INSERT_SQL = """
@@ -294,7 +303,6 @@ INSERT INTO riders (
 ) VALUES %s;
 """
 
-# Chunk support
 REQUIRED_TABLES_BASE = ("articles", "riders")
 REQUIRED_TABLES_WITH_CHUNKS = ("articles", "riders", "rider_chunks")
 
@@ -455,18 +463,17 @@ def build_and_embed_chunks(
 
     riders = fetch_riders_for_chunks(conn, only_missing=only_missing)
 
-    # Flatten chunk candidates
     chunk_rows: List[Tuple[int, str, int, str, int]] = []
-    for r in riders:
-        rider_id = int(r["id"])
-        for c in build_rider_chunks_from_row(r):
+    for rider in riders:
+        rider_id = int(rider["id"])
+        for chunk in build_rider_chunks_from_row(rider):
             chunk_rows.append(
                 (
                     rider_id,
-                    str(c["chunk_kind"]),
-                    int(c["chunk_ix"]),
-                    str(c["chunk_text"]),
-                    int(c["chunk_tokens"]),
+                    str(chunk["chunk_kind"]),
+                    int(chunk["chunk_ix"]),
+                    str(chunk["chunk_text"]),
+                    int(chunk["chunk_tokens"]),
                 )
             )
 
@@ -479,7 +486,6 @@ def build_and_embed_chunks(
         batch = chunk_rows[i : i + batch_size]
         texts = [row[3] for row in batch]
 
-        # Embed (concurrent recommended)
         vectors = embed_texts_concurrent(texts, max_workers=max_workers)
 
         if len(vectors) != len(texts):
@@ -492,14 +498,14 @@ def build_and_embed_chunks(
             )
 
         upsert_records: List[Tuple[int, str, int, str, int, List[float], str]] = []
-        for (row, vec) in zip(batch, vectors):
+        for row, vec in zip(batch, vectors):
             rider_id, chunk_kind, chunk_ix, chunk_text, chunk_tokens = row
             upsert_records.append(
                 (rider_id, chunk_kind, chunk_ix, chunk_text, chunk_tokens, vec, model_name)
             )
 
         if dry_run:
-            continue  # do not write
+            continue
 
         total_upserted += upsert_rider_chunks(conn, upsert_records, page_size=500)
 
@@ -523,21 +529,43 @@ def build_and_embed_chunks(
 # Main load routine (articles + riders)
 # ---------------------------------------------------------------------------
 
-def load_snapshot_incremental(
+def delete_riders_for_article_ids(cur, article_ids: List[int]) -> int:
+    if not article_ids:
+        return 0
+    cur.execute(
+        """
+        DELETE FROM public.riders
+        WHERE article_id = ANY(%s);
+        """,
+        (article_ids,),
+    )
+    return cur.rowcount
+
+
+def sync_snapshot_articles_and_riders(
     conn,
     input_path: Path,
     dry_run: bool,
 ) -> Dict[str, Any]:
     articles_in = _load_input(input_path)
     if not articles_in:
-        return {"snapshot": str(input_path), "inserted_articles": 0, "inserted_riders": 0, "skipped_no_url": 0}
+        return {
+            "snapshot": str(input_path),
+            "input_articles": 0,
+            "normalized_articles": 0,
+            "articles_resolved": 0,
+            "article_ids": 0,
+            "deleted_riders": 0,
+            "inserted_riders": 0,
+            "skipped_no_url": 0,
+        }
 
     normalized_articles: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
-    for a in articles_in:
-        na = normalize_article(a)
+    for article in articles_in:
+        na = normalize_article(article)
         if not na["url"]:
             continue
-        normalized_articles.append((na, a))
+        normalized_articles.append((na, article))
 
     skipped_no_url = len(articles_in) - len(normalized_articles)
 
@@ -545,26 +573,51 @@ def load_snapshot_incremental(
         assert_tables_exist(cur, REQUIRED_TABLES_BASE)
         assert_articles_url_unique(cur)
 
-        article_rows = [(na["title"], na["url"], na["body"], na["raw"]) for (na, _) in normalized_articles]
-        execute_values(cur, ARTICLE_UPSERT_SQL, article_rows, page_size=200)
+        article_rows = [
+            (na["title"], na["url"], na["body"], na["raw"])
+            for na, _ in normalized_articles
+        ]
+        if article_rows:
+            execute_values(cur, ARTICLE_UPSERT_SQL, article_rows, page_size=200)
 
-        inserted = cur.fetchall()  
-        url_to_article_id = {url: aid for (aid, url) in inserted}
-        inserted_articles = len(url_to_article_id)
+        urls = [na["url"] for na, _ in normalized_articles if na.get("url")]
+        url_to_article_id = fetch_article_ids_by_url(cur, urls)
+        article_ids = sorted(set(url_to_article_id.values()))
 
-        rider_rows = []
-        for (na, original_article) in normalized_articles:
-            aid = url_to_article_id.get(na["url"])
-            if not aid:
-                continue  
+        deleted_riders = delete_riders_for_article_ids(cur, article_ids)
 
-            for r in extract_riders(original_article):
-                nr = normalize_rider(r, aid)
+        rider_rows: List[Tuple[Any, ...]] = []
+        batch_seen = set()
+
+        for na, original_article in normalized_articles:
+            article_url = na["url"]
+            article_id = url_to_article_id.get(article_url)
+            if not article_id:
+                continue
+
+            for rider in extract_riders(original_article):
+                nr = normalize_rider(rider, article_id)
+
+                rider_name = (nr["name"] or "").strip().lower()
+                dedupe_key = (article_id, rider_name)
+                if dedupe_key in batch_seen:
+                    continue
+                batch_seen.add(dedupe_key)
+
                 rider_rows.append(
                     (
-                        nr["article_id"], nr["name"], nr["age"], nr["location"], nr["bike"], nr["key_items"],
-                        nr["frame_type"], nr["frame_material"], nr["wheel_size"], nr["tyre_width"],
-                        nr["electronic_shifting"], nr["raw"],
+                        nr["article_id"],
+                        nr["name"],
+                        nr["age"],
+                        nr["location"],
+                        nr["bike"],
+                        nr["key_items"],
+                        nr["frame_type"],
+                        nr["frame_material"],
+                        nr["wheel_size"],
+                        nr["tyre_width"],
+                        nr["electronic_shifting"],
+                        nr["raw"],
                     )
                 )
 
@@ -580,25 +633,26 @@ def load_snapshot_incremental(
 
     return {
         "snapshot": str(input_path),
-        "inserted_articles": inserted_articles,
+        "input_articles": len(articles_in),
+        "normalized_articles": len(normalized_articles),
+        "articles_resolved": len(url_to_article_id),
+        "article_ids": len(article_ids),
+        "deleted_riders": deleted_riders,
         "inserted_riders": inserted_riders,
         "skipped_no_url": skipped_no_url,
     }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Load cleaned DotWatcher snapshot; build+embed rider_chunks.")
+    parser = argparse.ArgumentParser(description="Load cleaned DotWatcher snapshot and optionally build rider_chunks.")
     parser.add_argument("--input", type=str, default="", help="Optional cleaned snapshot (.json/.jsonl).")
     parser.add_argument("--snap-dir", type=str, default=str(DEFAULT_SNAP_DIR), help="Snapshots directory.")
     parser.add_argument("--dry-run", action="store_true", help="Rollback everything; print stats only.")
 
-    # Chunk flags
     parser.add_argument("--with-chunks", action="store_true", help="Build+embed rider_chunks after loading.")
     parser.add_argument("--only-missing-chunks", action="store_true", help="Only build chunks for riders without chunks.")
-    parser.add_argument("--rebuild-chunks", action="store_true", help="TRUNCATE rider_chunks then rebuild (implies not only-missing).")
+    parser.add_argument("--rebuild-chunks", action="store_true", help="TRUNCATE rider_chunks then rebuild.")
     parser.add_argument("--chunk-batch-size", type=int, default=128, help="Embedding batch size for chunks.")
-
-    # Optional label stored in DB (even though Ollama model is controlled by settings.embedding_model)
     parser.add_argument("--chunk-embedding-model-name", type=str, default="ollama", help="Label stored in rider_chunks.model.")
     args = parser.parse_args()
 
@@ -607,15 +661,18 @@ def main() -> None:
     print(f"Loading snapshot: {input_path}")
 
     with get_pg_connection(autocommit=False) as conn:
-        # Load articles + riders
         register_vector(conn)
-        stats = load_snapshot_incremental(conn, input_path=input_path, dry_run=args.dry_run)
+
+        stats = sync_snapshot_articles_and_riders(
+            conn,
+            input_path=input_path,
+            dry_run=args.dry_run,
+        )
         print(f"Articles+riders stats: {stats}")
 
         if not args.with_chunks:
             return
 
-        # Ensure chunk table exists
         with conn.cursor() as cur:
             assert_tables_exist(cur, REQUIRED_TABLES_WITH_CHUNKS)
 

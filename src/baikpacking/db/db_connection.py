@@ -53,12 +53,20 @@ def get_pg_connection(autocommit: bool = False) -> Iterator[PGConnection]:
     """
     dsn = get_db_dsn()
     conn = psycopg2.connect(dsn)
-    register_vector(conn)
     conn.autocommit = autocommit
+    register_vector(conn)
+
     try:
         yield conn
+        if not autocommit:
+            conn.commit()
+    except Exception:
+        if not autocommit and not conn.closed:
+            conn.rollback()
+        raise
     finally:
-        conn.close()
+        if not conn.closed:
+            conn.close()
 
 
 def ping_db() -> dict:
