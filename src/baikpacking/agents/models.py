@@ -1,7 +1,7 @@
 
 
 from collections import Counter
-from typing import List, Optional
+from typing import List, Optional, Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -43,10 +43,16 @@ class SimilarRider(BaseModel):
 
     best_score: float
     year: Optional[int] = None
-    
-    bike: Optional[str] = None
-    key_items: Optional[str] = None
 
+    bike: Optional[str] = None
+    bike_type: Optional[str] = None
+    wheels: Optional[str] = None
+    tyres: Optional[str] = None
+    drivetrain: Optional[str] = None
+    bags: Optional[str] = None
+    sleep_system: Optional[str] = None
+
+    key_items: List[str] = Field(default_factory=list)
     chunks: List[ChunkInfo] = Field(default_factory=list)
 
 

@@ -68,6 +68,9 @@ KNOWN_EVENTS: Dict[str, str] = {
     "transcontinental race": "Transcontinental Race",
     "transcontinental": "Transcontinental Race",
     "tcr": "Transcontinental Race",
+    "kromvojoj": "Kromvojoj",
+    "kromvojoj race": "Kromvojoj",
+    
 }
 
 _EVENT_PREFIXES = (
@@ -113,6 +116,11 @@ _EVENT_SUFFIXES = {
     "trailscotland",
 }
 
+_EVENT_LEADING_FILLER_RE = re.compile(
+    r"^(?:for\s+|at\s+|in\s+|doing\s+|ride\s+|riding\s+|race\s+|racing\s+)+",
+    re.IGNORECASE,
+)
+
 _EVENT_CONNECTORS = {
     "and", "the", "of", "del", "de", "du", "la", "le", "y", "x", "&", "no",
 }
@@ -128,7 +136,7 @@ _EVENT_HINTS: Dict[str, List[str]] = {
     "transiberica": [
         "road ultra race",
         "endurance road bikepacking",
-        "long distance across Spain",
+        "long distance across Spain or Europe",
         "lightweight setup",
         "heat",
     ],
@@ -165,6 +173,18 @@ _EVENT_HINTS: Dict[str, List[str]] = {
         "remote",
     ],
 }
+
+_BAD_EVENT_CANDIDATE_PREFIXES = (
+    "recommend",
+    "show",
+    "give",
+    "find",
+    "suggest",
+    "tell",
+    "what",
+    "which",
+    "best",
+)
 
 _ARCHETYPE_ADJACENCY: Dict[str, List[str]] = {
     "mountain_gravel_ultra": ["gravel_ultra", "mountain_offroad_ultra"],
@@ -217,6 +237,42 @@ _COMPONENT_QUERY_PHRASES: Dict[str, str] = {
 }
 
 
+_COMPONENT_FILL_RULES: Dict[str, Dict[str, Any]] = {
+    "tyres": {
+        "target_field": "tyres",
+        "structured_field": "tyres",
+        "chunk_keywords": ["tyre", "tyres", "tire", "tires", "tubeless", "casing", "mm"],
+    },
+    "wheels": {
+        "target_field": "wheels",
+        "structured_field": "wheels",
+        "chunk_keywords": ["wheel", "wheels", "wheelset", "rim", "rims", "hub", "hubs", "650b", "700c", "29er", "27.5"],
+    },
+    "drivetrain": {
+        "target_field": "drivetrain",
+        "structured_field": "drivetrain",
+        "chunk_keywords": ["drivetrain", "groupset", "cassette", "chainring", "gearing", "gear ratio", "sram", "shimano", "grx", "1x", "2x"],
+    },
+    "bags": {
+        "target_field": "bags",
+        "structured_field": "bags",
+        "chunk_keywords": ["bag", "bags", "frame bag", "seat pack", "saddle bag", "top tube bag", "handlebar bag", "apidura", "tailfin", "ortlieb", "restrap"],
+    },
+    "sleep_system": {
+        "target_field": "sleep_system",
+        "structured_field": "sleep_system",
+        "chunk_keywords": ["sleep", "sleeping bag", "bivy", "bivvy", "quilt", "mat", "pad", "tent"],
+    },
+    "bike_type": {
+        "target_field": "bike_type",
+        "structured_field": "bike_type",
+        "chunk_keywords": ["gravel bike", "road bike", "endurance bike", "mountain bike", "mtb", "hardtail", "full suspension", "bike type", "frame"],
+    },
+}
+
+
+
+
 def _append_unique(items: List[str], value: Optional[str]) -> None:
     if not value:
         return
@@ -239,11 +295,18 @@ def _count_titleish_words(words: List[str]) -> int:
 def _clean_event_candidate(text: str) -> str:
     candidate = re.sub(r"\s+", " ", (text or "").strip(" \t\r\n?.,:;!()[]{}\"'"))
     candidate = _EVENT_FRAGMENT_RE.sub("", candidate).strip(" \t\r\n?.,:;!()[]{}\"'")
+    candidate = _EVENT_LEADING_FILLER_RE.sub("", candidate).strip()
     return candidate
 
 
 def _looks_like_event_name(candidate: str) -> bool:
     if not candidate:
+        return False
+
+    candidate = candidate.strip()
+    lowered = candidate.lower()
+
+    if any(lowered.startswith(prefix + " ") or lowered == prefix for prefix in _BAD_EVENT_CANDIDATE_PREFIXES):
         return False
 
     words = candidate.split()
@@ -252,6 +315,10 @@ def _looks_like_event_name(candidate: str) -> bool:
 
     lowered_words = [w.lower() for w in words]
     if all(w in _EVENT_STOPWORDS for w in lowered_words):
+        return False
+
+    # Reject verb + number patterns like "Recommend 3"
+    if len(words) == 2 and lowered_words[0] in _BAD_EVENT_CANDIDATE_PREFIXES and words[1].isdigit():
         return False
 
     has_digit = any(ch.isdigit() for ch in candidate)
@@ -321,17 +388,71 @@ def _extract_capitalized_spans(text: str) -> List[str]:
     ]
 
 
+
+def _extract_known_event_alias(user_query: str) -> Optional[str]:
+    text = (user_query or "").strip().lower()
+    if not text:
+        return None
+
+    # normalize punctuation to spaces
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    text = " ".join(text.split())
+
+    for alias in sorted(KNOWN_EVENTS, key=len, reverse=True):
+        alias_norm = re.sub(r"[^a-z0-9]+", " ", alias.lower()).strip()
+        if not alias_norm:
+            continue
+
+        # exact phrase containment with token boundaries
+        if re.search(rf"(?<![a-z0-9]){re.escape(alias_norm)}(?![a-z0-9])", text):
+            return KNOWN_EVENTS[alias]
+
+    return None
+
+
 def _extract_event_name(user_query: str) -> str:
     text = (user_query or "").strip()
     if not text:
         return "Unknown event"
 
+    # 1) Strongest path: known alias match from raw lowercase text
+    alias_hit = _extract_known_event_alias(text)
+    if alias_hit:
+        return alias_hit
+
     lowered = text.lower()
 
-    for alias in sorted(KNOWN_EVENTS, key=len, reverse=True):
-        if alias in lowered:
-            return KNOWN_EVENTS[alias]
+    # 2) Cleaned-query alias match
+    cleaned_lowered = _clean_event_candidate(lowered)
+    alias_hit = _extract_known_event_alias(cleaned_lowered)
+    if alias_hit:
+        return alias_hit
 
+    # 3) Token-overlap fallback
+    query_tokens = set(re.findall(r"[a-z0-9]+", cleaned_lowered))
+    best_name: Optional[str] = None
+    best_score = 0.0
+
+    for alias, canonical in KNOWN_EVENTS.items():
+        alias_tokens = set(re.findall(r"[a-z0-9]+", alias.lower()))
+        if not alias_tokens:
+            continue
+
+        inter = len(query_tokens & alias_tokens)
+        union = len(query_tokens | alias_tokens)
+        score = inter / union if union else 0.0
+
+        if alias_tokens.issubset(query_tokens):
+            score += 0.5
+
+        if score > best_score:
+            best_score = score
+            best_name = canonical
+
+    if best_name and best_score >= 0.4:
+        return best_name
+
+    # 4) Heuristic fallback only if everything else failed
     candidates: List[str] = []
 
     for pattern in _EVENT_CONTEXT_PATTERNS:
@@ -341,6 +462,7 @@ def _extract_event_name(user_query: str) -> str:
                 candidates.append(candidate)
 
     candidates.extend(_extract_capitalized_spans(text))
+    candidates = [c for c in candidates if _looks_like_event_name(c)]
 
     if not candidates:
         return "Unknown event"
@@ -1025,15 +1147,70 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
             similar_riders=compact_riders,
         )
 
+        def _first_nonempty(values: List[Optional[str]]) -> Optional[str]:
+            for v in values:
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            return None
+
+
+        def _fill_requested_component_from_riders(
+            rec: SetupRecommendation,
+            riders: List[Any],
+            query_component: str,
+        ) -> SetupRecommendation:
+            rule = _COMPONENT_FILL_RULES.get(query_component)
+            if not rule:
+                return rec
+
+            rs = rec.recommended_setup
+            target_field = rule["target_field"]
+            structured_field = rule["structured_field"]
+            chunk_keywords = [k.lower() for k in rule["chunk_keywords"]]
+
+            current_value = getattr(rs, target_field, None)
+            if isinstance(current_value, str) and current_value.strip():
+                return rec
+
+            structured_candidates: List[str] = []
+            chunk_candidates: List[str] = []
+
+            for r in riders:
+                structured_value = getattr(r, structured_field, None)
+                if isinstance(structured_value, str) and structured_value.strip():
+                    structured_candidates.append(structured_value.strip())
+
+                for c in getattr(r, "chunks", None) or []:
+                    text = (getattr(c, "text", None) or "").strip()
+                    if not text:
+                        continue
+
+                    tl = text.lower()
+                    if any(keyword in tl for keyword in chunk_keywords):
+                        chunk_candidates.append(text)
+
+            best = _first_nonempty(structured_candidates) or _first_nonempty(chunk_candidates)
+            if best:
+                setattr(rs, target_field, best)
+
+            return rec
+                
         rec = writer_agent.run_sync(writer_input.model_dump_json(indent=2)).output
         rec.similar_riders = riders
+
+        rec = _fill_requested_component_from_riders(
+            rec=rec,
+            riders=riders,
+            query_component=intent.component,
+        )
 
         if not rec.event or not rec.event.strip():
             rec.event = event_name
 
         return _postprocess_recommendation(rec), trace
 
-
+        
+        
 def recommend_setup(user_query: str) -> SetupRecommendation:
     rec, _trace = recommend_setup_with_trace(user_query)
     return rec
