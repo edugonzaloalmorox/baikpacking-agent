@@ -1,16 +1,22 @@
 import os
 import re
-from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 import logfire
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 
-from baikpacking.agents.models import SetupRecommendation, QueryIntent, RetrievalIntentBundle
+from baikpacking.agents.models import SetupRecommendation
+from baikpacking.agents.output_validation import _fill_requested_component_from_riders
+from baikpacking.agents.postprocess import (
+    _infer_event_from_riders as _postprocess_infer_event_from_riders,
+    _infer_year_from_title,
+    _postprocess_recommendation as _postprocess_recommendation_impl,
+)
+from baikpacking.agents.query_intent import _build_retrieval_intent_bundle, _classify_query_intent
+from baikpacking.agents.writer_input import WriterInput, _compact_riders, _event_context_to_text
 from baikpacking.embedding import embed_text
 from baikpacking.logging_config import setup_logging
 from baikpacking.tools.call_trace import CallTrace, record_trace_call, time_and_record
@@ -196,78 +202,6 @@ _ARCHETYPE_ADJACENCY: Dict[str, List[str]] = {
     "mtb_ultra": ["mountain_mtb_ultra", "offroad_bikepacking_ultra"],
     "desert_offroad_ultra": ["mountain_offroad_ultra", "desert_mtb_ultra"],
     "mountain_offroad_ultra": ["offroad_bikepacking_ultra", "mountain_mtb_ultra"],
-}
-
-_COMPONENT_PATTERNS: Dict[str, List[str]] = {
-    "lights": [
-        "light", "lights", "lighting", "dynamo", "dynamo hub", "son",
-        "supernova", "k-lite", "klite", "exposure", "rear light", "front light",
-    ],
-    "tyres": [
-        "tyre", "tyres", "tire", "tires", "tubeless", "casing", "width", "2.2", "2.35",
-        "continental", "gp5000", "maxxis", "ardent", "nobby nic", "schwalbe", "g-one",
-    ],
-    "bags": [
-        "bag", "bags", "frame bag", "seat pack", "handlebar roll", "cargo",
-        "apidura", "tailfin", "ortlieb", "restrap", "geosmina",
-    ],
-    "sleep_system": [
-        "sleep", "sleep system", "bivy", "bivvy", "quilt", "sleeping bag", "mat", "pad",
-    ],
-    "drivetrain": [
-        "drivetrain", "groupset", "group set", "group", "cassette", "chainring",
-        "gearing", "gear ratio", "grx", "sram", "shimano",
-    ],
-    "wheels": [
-        "wheel", "wheels", "rim", "rims", "hub", "hubs", "wheelset",
-    ],
-    "bike_type": [
-        "bike", "bike type", "frame", "hardtail", "gravel bike", "mtb", "mountain bike", "road", "custom build",
-    ],
-}
-
-_COMPONENT_QUERY_PHRASES: Dict[str, str] = {
-    "lights": "lighting setup, dynamo, front light, rear light, charging",
-    "tyres": "tyres, tire width, tubeless, casing",
-    "bags": "bikepacking bags, frame bag, seat pack, handlebar roll",
-    "sleep_system": "sleep setup, bivy, quilt, sleeping kit",
-    "drivetrain": "drivetrain, cassette, chainring, gearing, groupset",
-    "wheels": "wheels, wheelset, rims, hubs",
-    "bike_type": "bike type, frame, platform, gravel bike, mtb, hardtail",
-}
-
-
-_COMPONENT_FILL_RULES: Dict[str, Dict[str, Any]] = {
-    "tyres": {
-        "target_field": "tyres",
-        "structured_field": "tyres",
-        "chunk_keywords": ["tyre", "tyres", "tire", "tires", "tubeless", "casing", "mm"],
-    },
-    "wheels": {
-        "target_field": "wheels",
-        "structured_field": "wheels",
-        "chunk_keywords": ["wheel", "wheels", "wheelset", "rim", "rims", "hub", "hubs", "650b", "700c", "29er", "27.5"],
-    },
-    "drivetrain": {
-        "target_field": "drivetrain",
-        "structured_field": "drivetrain",
-        "chunk_keywords": ["drivetrain", "groupset", "cassette", "chainring", "gearing", "gear ratio", "sram", "shimano", "grx", "1x", "2x"],
-    },
-    "bags": {
-        "target_field": "bags",
-        "structured_field": "bags",
-        "chunk_keywords": ["bag", "bags", "frame bag", "seat pack", "saddle bag", "top tube bag", "handlebar bag", "apidura", "tailfin", "ortlieb", "restrap"],
-    },
-    "sleep_system": {
-        "target_field": "sleep_system",
-        "structured_field": "sleep_system",
-        "chunk_keywords": ["sleep", "sleeping bag", "bivy", "bivvy", "quilt", "mat", "pad", "tent"],
-    },
-    "bike_type": {
-        "target_field": "bike_type",
-        "structured_field": "bike_type",
-        "chunk_keywords": ["gravel bike", "road bike", "endurance bike", "mountain bike", "mtb", "hardtail", "full suspension", "bike type", "frame"],
-    },
 }
 
 
@@ -513,37 +447,11 @@ def _infer_year_from_title(title: Optional[str]) -> Optional[int]:
 
 
 def _infer_event_from_riders(rec: SetupRecommendation) -> Optional[str]:
-    titles = [
-        rider.event_title
-        for rider in (rec.similar_riders or [])
-        if isinstance(rider.event_title, str) and rider.event_title.strip()
-    ]
-    return Counter(titles).most_common(1)[0][0] if titles else None
+    return _postprocess_infer_event_from_riders(rec)
 
 
 def _postprocess_recommendation(rec: SetupRecommendation) -> SetupRecommendation:
-    for rider in rec.similar_riders:
-        for idx, chunk in enumerate(getattr(rider, "chunks", []) or []):
-            if chunk.chunk_index is None:
-                chunk.chunk_index = idx
-        if getattr(rider, "year", None) is None:
-            rider.year = _infer_year_from_title(getattr(rider, "event_title", None))
-
-    if not rec.event:
-        rec.event = _infer_event_from_riders(rec) or (
-            rec.similar_riders[0].event_title if rec.similar_riders else None
-        )
-
-    event_lower = (rec.event or "").lower()
-    rec.similar_riders.sort(
-        key=lambda rider: (
-            event_lower in (rider.event_title or "").lower(),
-            rider.best_score or 0,
-            rider.year or 0,
-        ),
-        reverse=True,
-    )
-    return rec
+    return _postprocess_recommendation_impl(rec)
 
 
 def infer_event_archetype(flags: Dict[str, bool]) -> Dict[str, Any]:
@@ -738,92 +646,6 @@ def _build_descriptor_query(
     }
 
 
-def _classify_query_intent(user_query: str) -> QueryIntent:
-    text = (user_query or "").strip().lower()
-    if not text:
-        return QueryIntent(component="full_setup", confidence=0.0)
-
-    scores = {
-        component: sum(1 for pattern in patterns if pattern in text)
-        for component, patterns in _COMPONENT_PATTERNS.items()
-    }
-    scores = {component: score for component, score in scores.items() if score > 0}
-
-    if not scores:
-        return QueryIntent(
-            component="full_setup",
-            confidence=0.25,
-            component_terms=[],
-            asks_for_recommendation=True,
-        )
-
-    best_component = max(scores.items(), key=lambda item: item[1])[0]
-    confidence = min(1.0, 0.35 + 0.15 * scores[best_component])
-
-    return QueryIntent(
-        component=best_component,
-        confidence=confidence,
-        component_terms=_COMPONENT_PATTERNS[best_component],
-        asks_for_recommendation=True,
-    )
-
-
-def _build_retrieval_intent_bundle(
-    descriptor: Dict[str, Any],
-    intent: QueryIntent,
-) -> RetrievalIntentBundle:
-    broad_query = descriptor["descriptor_query"]
-
-    if intent.component == "full_setup":
-        return RetrievalIntentBundle(
-            intent=intent,
-            broad_query=broad_query,
-            component_query=descriptor["descriptor_query_with_intent"],
-            include_component_query=False,
-        )
-
-    component_query = (
-        f"{broad_query}. Focus: {_COMPONENT_QUERY_PHRASES.get(intent.component, intent.component)}"
-    )
-
-    return RetrievalIntentBundle(
-        intent=intent,
-        broad_query=broad_query,
-        component_query=component_query,
-        include_component_query=True,
-    )
-
-
-class CompactChunk(BaseModel):
-    chunk_index: Optional[int] = None
-    text: str
-
-
-class CompactRider(BaseModel):
-    name: Optional[str] = None
-    event_title: Optional[str] = None
-    year: Optional[int] = None
-    best_score: Optional[float] = None
-    bike_type: Optional[str] = None
-    wheels: Optional[str] = None
-    tyres: Optional[str] = None
-    drivetrain: Optional[str] = None
-    bags: Optional[str] = None
-    sleep_system: Optional[str] = None
-    key_items: List[str] = Field(default_factory=list)
-    chunks: List[CompactChunk] = Field(default_factory=list)
-
-
-class WriterInput(BaseModel):
-    user_query: str
-    event_name: str
-    event_context: str
-    descriptor_query: str
-    query_component: str = "full_setup"
-    component_hit_count: int = 0
-    similar_riders: List[CompactRider]
-
-
 WRITER_PROMPT = """
 You are a bikepacking equipment and ultra-distance cycling expert.
 
@@ -867,63 +689,6 @@ def _build_deps(call_trace: Optional[CallTrace] = None) -> PgVectorSearchDeps:
         database_url=database_url,
         call_trace=call_trace,
     )
-
-
-def _compact_riders(riders: List[Any]) -> List[CompactRider]:
-    out: List[CompactRider] = []
-
-    for r in riders or []:
-        compact_chunks: List[CompactChunk] = []
-        for idx, c in enumerate(getattr(r, "chunks", []) or []):
-            text = getattr(c, "text", None) or getattr(c, "content", None) or ""
-            if text:
-                compact_chunks.append(
-                    CompactChunk(
-                        chunk_index=getattr(c, "chunk_index", idx),
-                        text=text[:300],
-                    )
-                )
-
-        key_items = []
-        raw_key_items = getattr(r, "key_items", None) or []
-        for item in raw_key_items[:5]:
-            if isinstance(item, str) and item.strip():
-                key_items.append(item.strip())
-
-        out.append(
-            CompactRider(
-                name=getattr(r, "name", None),
-                event_title=getattr(r, "event_title", None),
-                year=getattr(r, "year", None) or _infer_year_from_title(getattr(r, "event_title", None)),
-                best_score=getattr(r, "best_score", None),
-                bike_type=getattr(r, "bike_type", None),
-                wheels=getattr(r, "wheels", None),
-                tyres=getattr(r, "tyres", None),
-                drivetrain=getattr(r, "drivetrain", None),
-                bags=getattr(r, "bags", None),
-                sleep_system=getattr(r, "sleep_system", None),
-                key_items=key_items,
-                chunks=compact_chunks[:2],
-            )
-        )
-
-    return out
-
-
-def _event_context_to_text(event_context_obj: Any) -> str:
-    if not event_context_obj or not getattr(event_context_obj, "context", None):
-        return ""
-
-    ctx = event_context_obj.context
-    parts = [
-        ctx.summary or "",
-        ctx.surface or "",
-        ctx.route_character or "",
-        ctx.climate_notes or "",
-        ctx.resupply_notes or "",
-        " ".join(ctx.constraints or []),
-    ]
-    return "\n".join(p for p in parts if p)
 
 
 def _rider_component_hit_count(riders: List[Any], component_terms: List[str]) -> int:
@@ -1147,54 +912,6 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
             similar_riders=compact_riders,
         )
 
-        def _first_nonempty(values: List[Optional[str]]) -> Optional[str]:
-            for v in values:
-                if isinstance(v, str) and v.strip():
-                    return v.strip()
-            return None
-
-
-        def _fill_requested_component_from_riders(
-            rec: SetupRecommendation,
-            riders: List[Any],
-            query_component: str,
-        ) -> SetupRecommendation:
-            rule = _COMPONENT_FILL_RULES.get(query_component)
-            if not rule:
-                return rec
-
-            rs = rec.recommended_setup
-            target_field = rule["target_field"]
-            structured_field = rule["structured_field"]
-            chunk_keywords = [k.lower() for k in rule["chunk_keywords"]]
-
-            current_value = getattr(rs, target_field, None)
-            if isinstance(current_value, str) and current_value.strip():
-                return rec
-
-            structured_candidates: List[str] = []
-            chunk_candidates: List[str] = []
-
-            for r in riders:
-                structured_value = getattr(r, structured_field, None)
-                if isinstance(structured_value, str) and structured_value.strip():
-                    structured_candidates.append(structured_value.strip())
-
-                for c in getattr(r, "chunks", None) or []:
-                    text = (getattr(c, "text", None) or "").strip()
-                    if not text:
-                        continue
-
-                    tl = text.lower()
-                    if any(keyword in tl for keyword in chunk_keywords):
-                        chunk_candidates.append(text)
-
-            best = _first_nonempty(structured_candidates) or _first_nonempty(chunk_candidates)
-            if best:
-                setattr(rs, target_field, best)
-
-            return rec
-                
         rec = writer_agent.run_sync(writer_input.model_dump_json(indent=2)).output
         rec.similar_riders = riders
 
