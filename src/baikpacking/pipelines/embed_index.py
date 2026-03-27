@@ -1,14 +1,10 @@
 import argparse
-from typing import List, Tuple
 
 from baikpacking.embedding.config import Settings
-from baikpacking.embedding.embed import embed_riders_rows
 from baikpacking.db.db_connection import get_pg_connection
 from baikpacking.db.data_loader import (
-    fetch_riders,
-    truncate_rider_embeddings,
-    upsert_rider_embeddings,
-    fetch_riders_missing_embeddings,
+    build_and_embed_chunks,
+    truncate_rider_chunks,
 )
 
 settings = Settings()
@@ -19,42 +15,23 @@ def run_embed_riders(
     expected_dim: int = 1024,
     embed_all: bool = False,
 ) -> None:
-    """
-    Rebuild or incrementally upsert rider embeddings into Postgres/pgvector.
-
-    Default behavior (incremental):
-      - embed ONLY riders missing an embedding row
-
-    Full behavior (embed_all=True):
-      - embed ALL riders (useful if you changed the embedding model or text builder)
-    """
+    """Rebuild or incrementally embed rider chunks into Postgres/pgvector."""
     with get_pg_connection(autocommit=False) as conn:
         if rebuild:
-            truncate_rider_embeddings(conn)
+            truncate_rider_chunks(conn)
 
-        if rebuild or embed_all:
-            rows = fetch_riders(conn)
-            mode = "ALL riders"
-        else:
-            rows = fetch_riders_missing_embeddings(conn)
-            mode = "ONLY riders missing embeddings"
-
+        only_missing = not (rebuild or embed_all)
+        mode = "ALL riders" if not only_missing else "ONLY riders missing chunks"
         print(f"Mode: {mode}")
-        print(f"Riders fetched: {len(rows)}")
 
-        if not rows:
-            print("Nothing to embed.")
-            return
-
-        pairs = embed_riders_rows(rows, expected_dim=expected_dim)
-        print(f"Embeddings computed: {len(pairs)}")
-
-        records: List[Tuple[int, List[float], str]] = [
-            (rider_id, vec, settings.embedding_model) for (rider_id, vec) in pairs
-        ]
-
-        n = upsert_rider_embeddings(conn, records, page_size=500)
-        print(f"Upsert complete. Rows written: {n}")
+        stats = build_and_embed_chunks(
+            conn,
+            model_name=settings.embedding_model,
+            only_missing=only_missing,
+            batch_size=128,
+            dry_run=False,
+        )
+        print(f"Upsert complete. Stats: {stats}")
 
 
 def main() -> None:
