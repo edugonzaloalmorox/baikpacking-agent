@@ -59,7 +59,7 @@ def _missing_setup_fields(rs):
 
 
 def main() -> None:
-    query = 'What tyres should I use for GranGuanche 2024 road if I want to finish comfortably?'
+    query = 'What drivetrain should I use for Trasnpyrenees?'
     rec, trace = recommend_setup_with_trace(query)
 
     rs = rec.recommended_setup

@@ -27,9 +27,37 @@ _COMPONENT_PATTERNS: Dict[str, List[str]] = {
         "wheel", "wheels", "rim", "rims", "hub", "hubs", "wheelset",
     ],
     "bike_type": [
-        "bike", "bike type", "frame", "hardtail", "gravel bike", "mtb", "mountain bike", "road", "custom build",
+        "what bike should i use",
+        "which bike should i use",
+        "which bike",
+        "what bike",
+        "bike choice",
+        "bike platform",
+        "bike platform should i use",
+        "frame choice",
+        "choose a bike",
+        "hardtail or gravel bike",
+        "gravel bike or mtb",
+        "mtb or gravel bike",
+        "hardtail or mtb",
+        "gravel bike",
+        "mtb",
+        "mountain bike",
+        "road bike",
     ],
 }
+
+_FULL_SETUP_PATTERNS: List[str] = [
+    "bikepacking setup",
+    "setup for",
+    "recommend a setup",
+    "suggest a setup",
+    "complete setup",
+    "full setup",
+    "entire setup",
+    "bike setup",
+    "gear setup",
+]
 
 
 _COMPONENT_QUERY_PHRASES: Dict[str, str] = {
@@ -48,11 +76,47 @@ def _classify_query_intent(user_query: str) -> QueryIntent:
     if not text:
         return QueryIntent(component="full_setup", confidence=0.0)
 
+    if any(pattern in text for pattern in _FULL_SETUP_PATTERNS):
+        return QueryIntent(
+            component="full_setup",
+            confidence=0.25,
+            component_terms=[],
+            asks_for_recommendation=True,
+        )
+
     scores = {
         component: sum(1 for pattern in patterns if pattern in text)
         for component, patterns in _COMPONENT_PATTERNS.items()
     }
     scores = {component: score for component, score in scores.items() if score > 0}
+
+    if not scores:
+        return QueryIntent(
+            component="full_setup",
+            confidence=0.25,
+            component_terms=[],
+            asks_for_recommendation=True,
+        )
+
+    if "bike_type" in scores:
+        explicit_bike_type_phrases = (
+            "what bike should i use",
+            "which bike should i use",
+            "which bike",
+            "what bike",
+            "bike choice",
+            "bike platform",
+            "frame choice",
+            "choose a bike",
+            "hardtail or gravel bike",
+            "gravel bike or mtb",
+            "mtb or gravel bike",
+            "hardtail or mtb",
+            "bike type",
+            "bike type?",
+        )
+        if not any(phrase in text for phrase in explicit_bike_type_phrases):
+            scores.pop("bike_type", None)
 
     if not scores:
         return QueryIntent(
