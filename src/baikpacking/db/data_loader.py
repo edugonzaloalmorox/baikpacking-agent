@@ -429,10 +429,34 @@ def fetch_riders_for_chunks(conn, only_missing: bool) -> List[Dict[str, Any]]:
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
+def fetch_riders(conn) -> List[Dict[str, Any]]:
+    """
+    Backward-compatible alias for legacy embedding code.
+
+    The current loader stores rider vectors as rider_chunks, so the chunk fetch
+    query already returns the rider shape used by embedding code.
+    """
+    return fetch_riders_for_chunks(conn, only_missing=False)
+
+
+def fetch_riders_missing_embeddings(conn) -> List[Dict[str, Any]]:
+    """
+    Backward-compatible alias for legacy incremental embedding code.
+    """
+    return fetch_riders_for_chunks(conn, only_missing=True)
+
+
 def truncate_rider_chunks(conn) -> None:
     with conn.cursor() as cur:
         cur.execute(TRUNCATE_RIDER_CHUNKS_SQL)
     conn.commit()
+
+
+def truncate_rider_embeddings(conn) -> None:
+    """
+    Backward-compatible alias for the older rider_embeddings API.
+    """
+    truncate_rider_chunks(conn)
 
 
 def upsert_rider_chunks(
@@ -449,6 +473,28 @@ def upsert_rider_chunks(
         execute_values(cur, UPSERT_RIDER_CHUNKS_SQL, records, page_size=page_size)
     conn.commit()
     return len(records)
+
+
+def upsert_rider_embeddings(
+    conn,
+    records: List[Tuple[int, List[float], str]],
+    page_size: int = 500,
+) -> int:
+    """
+    Backward-compatible alias for legacy embedding callers.
+
+    The current schema stores embeddings in rider_chunks, so each rider gets a
+    single synthetic embedding chunk. This keeps old import paths working while
+    the chunk-based pipeline is the primary path.
+    """
+    if not records:
+        return 0
+
+    chunk_records: List[Tuple[int, str, int, str, int, List[float], str]] = [
+        (int(rider_id), "embedding", 0, "", 0, vec, model)
+        for rider_id, vec, model in records
+    ]
+    return upsert_rider_chunks(conn, chunk_records, page_size=page_size)
 
 
 def build_and_embed_chunks(
