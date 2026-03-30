@@ -145,33 +145,6 @@ _BAD_EVENT_CANDIDATE_PREFIXES = (
     "best",
 )
 
-_REQUESTED_COUNT_WORDS = (
-    "bike",
-    "bikes",
-    "tyre",
-    "tyres",
-    "tire",
-    "tires",
-    "bag",
-    "bags",
-    "wheel",
-    "wheels",
-    "option",
-    "options",
-    "setup",
-    "setups",
-)
-
-_REQUESTED_COUNT_PREFIX_RE = re.compile(
-    rf"\b(?:give me|give|recommend|suggest|show me|show|find me|find|list|top|best)\s+(?:me\s+)?(?P<count>[1-9]|1\d|20)\s+(?P<unit>{'|'.join(_REQUESTED_COUNT_WORDS)})(?:\s+options?)?\b",
-    re.IGNORECASE,
-)
-
-_REQUESTED_COUNT_GENERAL_RE = re.compile(
-    rf"\b(?P<count>[1-9]|1\d|20)\s+(?P<unit>{'|'.join(_REQUESTED_COUNT_WORDS)})(?:\s+options?)?\b",
-    re.IGNORECASE,
-)
-
 
 def _count_titleish_words(words: List[str]) -> int:
     return sum(
@@ -193,8 +166,6 @@ def _looks_like_event_name(candidate: str) -> bool:
         return False
 
     candidate = candidate.strip()
-    if candidate.replace(" ", "").isdigit():
-        return False
     lowered = candidate.lower()
 
     if any(lowered.startswith(prefix + " ") or lowered == prefix for prefix in _BAD_EVENT_CANDIDATE_PREFIXES):
@@ -283,30 +254,6 @@ def _extract_known_event_alias(user_query: str) -> Optional[str]:
     return match[1] if match else None
 
 
-def _extract_requested_count(user_query: str) -> Optional[int]:
-    text = (user_query or "").strip()
-    if not text:
-        return None
-
-    for pattern in (_REQUESTED_COUNT_PREFIX_RE, _REQUESTED_COUNT_GENERAL_RE):
-        match = pattern.search(text)
-        if match:
-            value = int(match.group("count"))
-            if value > 0:
-                return value
-    return None
-
-
-def _strip_requested_count_phrase(user_query: str) -> str:
-    text = (user_query or "").strip()
-    if not text:
-        return text
-
-    for pattern in (_REQUESTED_COUNT_PREFIX_RE, _REQUESTED_COUNT_GENERAL_RE):
-        text = pattern.sub(" ", text, count=1)
-    return re.sub(r"\s+", " ", text).strip()
-
-
 def _find_known_event_alias_match(user_query: str) -> Optional[Tuple[str, str]]:
     text = (user_query or "").strip().lower()
     if not text:
@@ -327,7 +274,7 @@ def _find_known_event_alias_match(user_query: str) -> Optional[Tuple[str, str]]:
 
 
 def _extract_event_name(user_query: str) -> str:
-    text = _strip_requested_count_phrase(user_query).strip()
+    text = (user_query or "").strip()
     if not text:
         return "Unknown event"
 
@@ -408,10 +355,8 @@ def _event_hint_descriptors(event_name: Optional[str]) -> List[str]:
 
 
 def resolve_event(user_query: str) -> EventResolutionResult:
-    requested_count = _extract_requested_count(user_query)
-    cleaned_query = _strip_requested_count_phrase(user_query)
-    display_name = _extract_event_name(cleaned_query or user_query)
-    alias_match = _find_known_event_alias_match(cleaned_query or user_query)
+    display_name = _extract_event_name(user_query)
+    alias_match = _find_known_event_alias_match(user_query)
 
     if alias_match:
         matched_alias, canonical_name = alias_match
@@ -420,20 +365,18 @@ def resolve_event(user_query: str) -> EventResolutionResult:
 
         if alias_norm == canonical_norm:
             return EventResolutionResult(
-            raw_query_event=matched_alias,
-            canonical_name=canonical_name,
-            display_name=display_name,
-            requested_count=requested_count,
-            match_type="exact",
-            confidence=0.98,
-            is_trusted_exact=True,
+                raw_query_event=matched_alias,
+                canonical_name=canonical_name,
+                display_name=display_name,
+                match_type="exact",
+                confidence=0.98,
+                is_trusted_exact=True,
             )
 
         return EventResolutionResult(
             raw_query_event=matched_alias,
             canonical_name=canonical_name,
             display_name=display_name,
-            requested_count=requested_count,
             match_type="alias",
             confidence=0.93,
             is_trusted_exact=False,
@@ -446,7 +389,6 @@ def resolve_event(user_query: str) -> EventResolutionResult:
             raw_query_event=display_name,
             canonical_name=canonical_name,
             display_name=display_name,
-            requested_count=requested_count,
             match_type="exact",
             confidence=0.85,
             is_trusted_exact=True,
@@ -456,7 +398,6 @@ def resolve_event(user_query: str) -> EventResolutionResult:
         raw_query_event=None if display_name == "Unknown event" else display_name,
         canonical_name=None,
         display_name=display_name,
-        requested_count=requested_count,
         match_type="unknown",
         confidence=0.15 if display_name == "Unknown event" else 0.35,
         is_trusted_exact=False,

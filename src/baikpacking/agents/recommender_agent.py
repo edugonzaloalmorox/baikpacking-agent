@@ -1,33 +1,13 @@
 import os
 import re
-from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
-import anyio
 import logfire
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 
-from baikpacking.agents.event_resolution import (
-    KNOWN_EVENTS,
-    _clean_event_candidate,
-    _count_titleish_words,
-    _event_hint_descriptors,
-    _extract_capitalized_spans,
-    _extract_event_name as _extract_event_name_impl,
-    _extract_known_event_alias,
-    _is_valid_event_name,
-    _looks_like_event_name,
-    _score_event_candidate,
-    resolve_event,
-)
-from baikpacking.agents.event_context_resolution import (
-    _build_descriptor_query as _build_descriptor_query_impl,
-    fetch_event_context_summary,
-    infer_event_archetype as _infer_event_archetype_impl,
-)
 from baikpacking.agents.models import SetupRecommendation
 from baikpacking.agents.output_validation import _fill_requested_component_from_riders
 from baikpacking.agents.postprocess import (
@@ -35,15 +15,12 @@ from baikpacking.agents.postprocess import (
     _infer_year_from_title,
     _postprocess_recommendation as _postprocess_recommendation_impl,
 )
-from baikpacking.agents.policy import select_policy
 from baikpacking.agents.query_intent import _build_retrieval_intent_bundle, _classify_query_intent
-from baikpacking.agents.evidence_summary import _rider_component_hit_count, summarize_evidence
-from baikpacking.agents.orchestration_models import RetrievalExecutionResult
-from baikpacking.agents.retrieval_planning import build_retrieval_plan
-from baikpacking.agents.writer_input import WriterInput, _compact_riders
+from baikpacking.agents.writer_input import WriterInput, _compact_riders, _event_context_to_text
 from baikpacking.embedding import embed_text
 from baikpacking.logging_config import setup_logging
 from baikpacking.tools.call_trace import CallTrace, record_trace_call, time_and_record
+from baikpacking.tools.event_context import run_event_web_search_sync
 from baikpacking.tools.pg_vector_search import PgVectorSearchDeps
 from baikpacking.tools.riders import run_search_similar_riders
 
@@ -70,59 +47,164 @@ DEFAULT_MAX_CHUNKS_PER_RIDER = 2
 DEFAULT_TOP_K_CHUNKS = 80
 
 _YEAR_RE = re.compile(r"(19|20)\d{2}")
+_KM_RE = re.compile(r"(\d{2,4})\s*km\b", re.IGNORECASE)
+_M_RE = re.compile(r"(\d{3,5})\s*m\b", re.IGNORECASE)
+
+_WORD_TOKEN_RE = re.compile(r"[A-Za-z0-9'&\-]+|[?.,:;!()]")
+_TITLEISH_TOKEN_RE = re.compile(r"^[A-Z0-9][A-Za-z0-9'&\-]*$")
+_ALLCAPS_SHORT_RE = re.compile(r"^[A-Z0-9]{2,6}$")
+_EVENT_FRAGMENT_RE = re.compile(
+    r"\b(?:official|website|site|rules|route|registration|terrain|weather|setup|gear)\b.*$",
+    re.IGNORECASE,
+)
+
+KNOWN_EVENTS: Dict[str, str] = {
+    "atlas mountain race": "Atlas Mountain Race",
+    "amr": "Atlas Mountain Race",
+    "transiberica": "Transiberica",
+    "gb duro": "GB Duro",
+    "silk road mountain race": "Silk Road Mountain Race",
+    "srmr": "Silk Road Mountain Race",
+    "tour divide": "Tour Divide",
+    "badlands": "Badlands",
+    "highland trail 550": "Highland Trail 550",
+    "ht550": "Highland Trail 550",
+    "arizona trail race": "Arizona Trail Race",
+    "aztr": "Arizona Trail Race",
+    "transcontinental race": "Transcontinental Race",
+    "transcontinental": "Transcontinental Race",
+    "tcr": "Transcontinental Race",
+    "kromvojoj": "Kromvojoj",
+    "kromvojoj race": "Kromvojoj",
+    
+}
+
+_EVENT_PREFIXES = (
+    "for",
+    "use",
+    "bring",
+    "take",
+    "ride",
+    "riding",
+    "setup for",
+    "set up for",
+    "at",
+    "in",
+    "doing",
+    "race",
+    "event",
+)
+
+_EVENT_CONTEXT_PATTERNS = [
+    re.compile(
+        rf"\b(?:{'|'.join(p.replace(' ', r'\s+') for p in _EVENT_PREFIXES)})\s+the\s+([A-Z][A-Za-z0-9'&\- ]{{2,80}})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:{'|'.join(p.replace(' ', r'\s+') for p in _EVENT_PREFIXES)})\s+([A-Z][A-Za-z0-9'&\- ]{{2,80}})",
+        re.IGNORECASE,
+    ),
+]
+
+_EVENT_SUFFIXES = {
+    "race",
+    "divide",
+    "challenge",
+    "tour",
+    "trail",
+    "duro",
+    "dash",
+    "bikingman",
+    "brevet",
+    "ultra",
+    "rally",
+    "odyssey",
+    "trailscotland",
+}
+
+_EVENT_LEADING_FILLER_RE = re.compile(
+    r"^(?:for\s+|at\s+|in\s+|doing\s+|ride\s+|riding\s+|race\s+|racing\s+)+",
+    re.IGNORECASE,
+)
+
+_EVENT_CONNECTORS = {
+    "and", "the", "of", "del", "de", "du", "la", "le", "y", "x", "&", "no",
+}
+
+_EVENT_STOPWORDS = {
+    "what", "which", "should", "could", "would", "recommend", "use", "bring",
+    "setup", "set", "up", "do", "i", "you", "for", "at", "in", "to", "my",
+    "best", "good", "bike", "bags", "lights", "tyres", "tires", "wheels",
+    "drivetrain", "sleep", "sleeping", "system",
+}
+
+_EVENT_HINTS: Dict[str, List[str]] = {
+    "transiberica": [
+        "road ultra race",
+        "endurance road bikepacking",
+        "long distance across Spain or Europe",
+        "lightweight setup",
+        "heat",
+    ],
+    "atlas mountain race": [
+        "mountainous",
+        "off-road",
+        "remote",
+        "night riding",
+        "long climbs",
+    ],
+    "gb duro": [
+        "off-road bikepacking ultra",
+        "mountainous",
+        "remote",
+        "rough terrain",
+    ],
+    "silk road mountain race": [
+        "mountainous",
+        "mtb ultra",
+        "remote",
+        "high altitude",
+        "rough terrain",
+    ],
+    "tour divide": [
+        "off-road bikepacking ultra",
+        "long distance",
+        "remote",
+        "mixed dirt roads",
+    ],
+    "badlands": [
+        "gravel ultra race",
+        "arid",
+        "heat",
+        "remote",
+    ],
+}
+
+_BAD_EVENT_CANDIDATE_PREFIXES = (
+    "recommend",
+    "show",
+    "give",
+    "find",
+    "suggest",
+    "tell",
+    "what",
+    "which",
+    "best",
+)
+
+_ARCHETYPE_ADJACENCY: Dict[str, List[str]] = {
+    "mountain_gravel_ultra": ["gravel_ultra", "mountain_offroad_ultra"],
+    "gravel_ultra": ["mountain_gravel_ultra", "offroad_bikepacking_ultra"],
+    "mountain_road_ultra": ["road_ultra"],
+    "road_ultra": ["mountain_road_ultra"],
+    "desert_mtb_ultra": ["mountain_mtb_ultra", "desert_offroad_ultra"],
+    "mountain_mtb_ultra": ["mtb_ultra", "mountain_offroad_ultra"],
+    "mtb_ultra": ["mountain_mtb_ultra", "offroad_bikepacking_ultra"],
+    "desert_offroad_ultra": ["mountain_offroad_ultra", "desert_mtb_ultra"],
+    "mountain_offroad_ultra": ["offroad_bikepacking_ultra", "mountain_mtb_ultra"],
+}
 
 
-def _normalize_event_title(value: Optional[str]) -> str:
-    text = (value or "").lower()
-    text = re.sub(r"\b(19|20)\d{2}\b", " ", text)
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    return " ".join(text.split())
-
-
-def _infer_retrieval_grounding(
-    event_resolution: Any,
-    event_context_summary: Any,
-    riders: List[Any],
-    fallback_used: bool,
-) -> Dict[str, Any]:
-    event_keys = [
-        getattr(event_resolution, "canonical_name", None),
-        getattr(event_resolution, "display_name", None),
-        getattr(event_resolution, "raw_query_event", None),
-    ]
-    normalized_event_keys = {
-        key for key in (_normalize_event_title(key) for key in event_keys) if key
-    }
-
-    title_counts: Counter[str] = Counter()
-    exact_event_hit_count = 0
-
-    for rider in riders or []:
-        title = getattr(rider, "event_title", None)
-        normalized_title = _normalize_event_title(title)
-        if not normalized_title:
-            continue
-        title_counts[title] += 1
-        if any(
-            normalized_title == key or normalized_title in key or key in normalized_title
-            for key in normalized_event_keys
-        ):
-            exact_event_hit_count += 1
-
-    if exact_event_hit_count > 0:
-        retrieval_source = "exact_event"
-    elif fallback_used or getattr(event_context_summary, "similar_events", None) or getattr(event_context_summary, "event_family", None):
-        retrieval_source = "similar_event"
-    else:
-        retrieval_source = "unknown_global"
-
-    matched_event_name = title_counts.most_common(1)[0][0] if title_counts else None
-
-    return {
-        "retrieval_source": retrieval_source,
-        "exact_event_hit_count": exact_event_hit_count,
-        "matched_event_name": matched_event_name,
-    }
 
 
 def _append_unique(items: List[str], value: Optional[str]) -> None:
@@ -137,8 +219,190 @@ def _has_any(text: str, keywords: List[str]) -> bool:
     return any(k in text for k in keywords)
 
 
+def _count_titleish_words(words: List[str]) -> int:
+    return sum(
+        1
+        for word in words
+        if word.lower() not in _EVENT_CONNECTORS and _TITLEISH_TOKEN_RE.match(word)
+    )
+
+def _clean_event_candidate(text: str) -> str:
+    candidate = re.sub(r"\s+", " ", (text or "").strip(" \t\r\n?.,:;!()[]{}\"'"))
+    candidate = _EVENT_FRAGMENT_RE.sub("", candidate).strip(" \t\r\n?.,:;!()[]{}\"'")
+    candidate = _EVENT_LEADING_FILLER_RE.sub("", candidate).strip()
+    return candidate
+
+
+def _looks_like_event_name(candidate: str) -> bool:
+    if not candidate:
+        return False
+
+    candidate = candidate.strip()
+    lowered = candidate.lower()
+
+    if any(lowered.startswith(prefix + " ") or lowered == prefix for prefix in _BAD_EVENT_CANDIDATE_PREFIXES):
+        return False
+
+    words = candidate.split()
+    if not (1 <= len(words) <= 8):
+        return False
+
+    lowered_words = [w.lower() for w in words]
+    if all(w in _EVENT_STOPWORDS for w in lowered_words):
+        return False
+
+    # Reject verb + number patterns like "Recommend 3"
+    if len(words) == 2 and lowered_words[0] in _BAD_EVENT_CANDIDATE_PREFIXES and words[1].isdigit():
+        return False
+
+    has_digit = any(ch.isdigit() for ch in candidate)
+    has_suffix = any(w.lower() in _EVENT_SUFFIXES for w in words)
+    titleish_count = _count_titleish_words(words)
+
+    if has_digit or has_suffix or titleish_count >= 2:
+        return True
+
+    return len(words) == 1 and bool(re.match(r"^[A-Z][A-Za-z0-9'&\-]{3,}$", words[0]))
+
+
+def _score_event_candidate(candidate: str) -> int:
+    words = candidate.split()
+    score = 0
+
+    if any(ch.isdigit() for ch in candidate):
+        score += 3
+    if any(w.lower() in _EVENT_SUFFIXES for w in words):
+        score += 4
+
+    score += min(_count_titleish_words(words), 4)
+
+    if 1 <= len(words) <= 5:
+        score += 2
+    if candidate.lower() in KNOWN_EVENTS:
+        score += 10
+
+    return score
+
+
+def _extract_capitalized_spans(text: str) -> List[str]:
+    if not text:
+        return []
+
+    tokens = _WORD_TOKEN_RE.findall(text)
+    spans: List[str] = []
+    current: List[str] = []
+
+    def flush() -> None:
+        nonlocal current
+        if current:
+            spans.append(" ".join(current))
+            current = []
+
+    for token in tokens:
+        if re.match(r"^[?.,:;!()]$", token):
+            flush()
+            continue
+
+        lower = token.lower()
+        is_connector = lower in _EVENT_CONNECTORS
+        is_titleish = bool(_TITLEISH_TOKEN_RE.match(token))
+        is_short_alias = bool(_ALLCAPS_SHORT_RE.match(token))
+
+        if is_titleish or is_short_alias or (current and is_connector):
+            current.append(token)
+        else:
+            flush()
+
+    flush()
+
+    return [
+        cleaned
+        for span in spans
+        if (cleaned := _clean_event_candidate(span)) and _looks_like_event_name(cleaned)
+    ]
+
+
+
+def _extract_known_event_alias(user_query: str) -> Optional[str]:
+    text = (user_query or "").strip().lower()
+    if not text:
+        return None
+
+    # normalize punctuation to spaces
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    text = " ".join(text.split())
+
+    for alias in sorted(KNOWN_EVENTS, key=len, reverse=True):
+        alias_norm = re.sub(r"[^a-z0-9]+", " ", alias.lower()).strip()
+        if not alias_norm:
+            continue
+
+        # exact phrase containment with token boundaries
+        if re.search(rf"(?<![a-z0-9]){re.escape(alias_norm)}(?![a-z0-9])", text):
+            return KNOWN_EVENTS[alias]
+
+    return None
+
+
 def _extract_event_name(user_query: str) -> str:
-    return _extract_event_name_impl(user_query)
+    text = (user_query or "").strip()
+    if not text:
+        return "Unknown event"
+
+    # 1) Strongest path: known alias match from raw lowercase text
+    alias_hit = _extract_known_event_alias(text)
+    if alias_hit:
+        return alias_hit
+
+    lowered = text.lower()
+
+    # 2) Cleaned-query alias match
+    cleaned_lowered = _clean_event_candidate(lowered)
+    alias_hit = _extract_known_event_alias(cleaned_lowered)
+    if alias_hit:
+        return alias_hit
+
+    # 3) Token-overlap fallback
+    query_tokens = set(re.findall(r"[a-z0-9]+", cleaned_lowered))
+    best_name: Optional[str] = None
+    best_score = 0.0
+
+    for alias, canonical in KNOWN_EVENTS.items():
+        alias_tokens = set(re.findall(r"[a-z0-9]+", alias.lower()))
+        if not alias_tokens:
+            continue
+
+        inter = len(query_tokens & alias_tokens)
+        union = len(query_tokens | alias_tokens)
+        score = inter / union if union else 0.0
+
+        if alias_tokens.issubset(query_tokens):
+            score += 0.5
+
+        if score > best_score:
+            best_score = score
+            best_name = canonical
+
+    if best_name and best_score >= 0.4:
+        return best_name
+
+    # 4) Heuristic fallback only if everything else failed
+    candidates: List[str] = []
+
+    for pattern in _EVENT_CONTEXT_PATTERNS:
+        for match in pattern.finditer(text):
+            candidate = _clean_event_candidate(match.group(1))
+            if _looks_like_event_name(candidate):
+                candidates.append(candidate)
+
+    candidates.extend(_extract_capitalized_spans(text))
+    candidates = [c for c in candidates if _looks_like_event_name(c)]
+
+    if not candidates:
+        return "Unknown event"
+
+    normalized = [KNOWN_EVENTS.get(candidate.lower(), candidate) for candidate in candidates]
+    return max(normalized, key=_score_event_candidate)
 
 def _query_surface_hint(user_query: str) -> Optional[str]:
     q = f" {(user_query or '').lower()} "
@@ -149,6 +413,30 @@ def _query_surface_hint(user_query: str) -> Optional[str]:
     if " trail " in q or " mtb " in q or " mountain bike " in q:
         return "trail"
     return None
+
+
+def _is_valid_event_name(event_name: Optional[str]) -> bool:
+    if not event_name:
+        return False
+
+    event_name = event_name.strip()
+    if not event_name or event_name.lower() == "unknown event":
+        return False
+    if len(event_name.split()) > 8:
+        return False
+
+    lowered = event_name.lower()
+    bad_prefixes = (
+        "what ", "which ", "how ", "recommend ", "setup ", "set up ",
+        "should ", "could ", "would ",
+    )
+    return not any(lowered.startswith(prefix) for prefix in bad_prefixes)
+
+
+def _event_hint_descriptors(event_name: Optional[str]) -> List[str]:
+    if not _is_valid_event_name(event_name):
+        return []
+    return _EVENT_HINTS.get(event_name.strip().lower(), [])
 
 
 def _infer_year_from_title(title: Optional[str]) -> Optional[int]:
@@ -167,32 +455,127 @@ def _postprocess_recommendation(rec: SetupRecommendation) -> SetupRecommendation
 
 
 def infer_event_archetype(flags: Dict[str, bool]) -> Dict[str, Any]:
-    return _infer_event_archetype_impl(flags)
+    terrain: List[str] = []
+    environment: List[str] = []
+    format_: List[str] = ["ultra"]
+
+    if flags.get("mountain"):
+        terrain.append("mountainous")
+    if flags.get("desert"):
+        environment.append("desert")
+    if flags.get("remote"):
+        environment.append("remote")
+        format_.append("self_supported")
+    if flags.get("cold_hot"):
+        environment.append("temperature_swings")
+    if flags.get("night"):
+        format_.append("night_riding")
+    if flags.get("navigation"):
+        format_.append("navigation_heavy")
+
+    if flags.get("mtb"):
+        surface_family = "mtb"
+    elif flags.get("gravel"):
+        surface_family = "gravel"
+    elif flags.get("road"):
+        surface_family = "road"
+    elif flags.get("off_road"):
+        surface_family = "mixed_offroad"
+    else:
+        surface_family = "unknown"
+
+    if surface_family == "mtb":
+        archetype = "desert_mtb_ultra" if flags.get("desert") else (
+            "mountain_mtb_ultra" if flags.get("mountain") else "mtb_ultra"
+        )
+    elif surface_family == "gravel":
+        archetype = "mountain_gravel_ultra" if flags.get("mountain") else "gravel_ultra"
+    elif surface_family == "road":
+        archetype = "mountain_road_ultra" if flags.get("mountain") else "road_ultra"
+    elif surface_family == "mixed_offroad":
+        if flags.get("desert"):
+            archetype = "desert_offroad_ultra"
+        elif flags.get("mountain"):
+            archetype = "mountain_offroad_ultra"
+        else:
+            archetype = "offroad_bikepacking_ultra"
+    else:
+        archetype = "general_bikepacking_ultra"
+
+    return {
+        "archetype": archetype,
+        "surface_family": surface_family,
+        "terrain": terrain,
+        "environment": environment,
+        "format": format_,
+    }
 
 
 def _keyword_flags(text: str) -> Dict[str, bool]:
-    from baikpacking.agents.event_context_resolution import _keyword_flags as _impl
-    return _impl(text)
+    text = (text or "").lower()
+
+    keyword_map = {
+        "road": ["road race", "paved", "tarmac", "asphalt", "road ultra", "road cycling"],
+        "gravel": ["gravel", "gravel race", "dirt road", "fire road", "unbound"],
+        "mtb": [
+            "mtb", "mountain bike", "singletrack", "technical", "rocky", "hardtail",
+            "full suspension", "29er", "trail bike",
+        ],
+        "off_road": [
+            "off-road", "off road", "singletrack", "track", "rocky", "trail",
+            "technical", "jeep track", "doubletrack", "rough terrain", "dirt road",
+        ],
+        "desert": ["desert", "sahara", "arid", "dry", "sand"],
+        "mountain": ["mountain", "alpine", "climb", "elevation", "pass", "high mountains"],
+        "remote": [
+            "remote", "self-supported", "self supported", "unsupported",
+            "no services", "minimal resupply",
+        ],
+        "night": ["night", "dark", "overnight"],
+        "cold_hot": ["temperature", "cold", "hot", "heat", "freezing", "temperature swings"],
+        "navigation": ["navigation", "gps", "route", "track", "waypoint", "gpx"],
+    }
+    return {name: _has_any(text, terms) for name, terms in keyword_map.items()}
 
 
 def _extract_metrics(text: str) -> Dict[str, Optional[int]]:
-    from baikpacking.agents.event_context_resolution import _extract_metrics as _impl
-    return _impl(text)
+    km_match = _KM_RE.search(text or "")
+    elevation_match = _M_RE.search(text or "")
+
+    return {
+        "distance_km": int(km_match.group(1)) if km_match else None,
+        "elevation_m": int(elevation_match.group(1)) if elevation_match else None,
+    }
 
 
 def _surface_descriptors(surface_family: str) -> List[str]:
-    from baikpacking.agents.event_context_resolution import _surface_descriptors as _impl
-    return _impl(surface_family)
+    return {
+        "road": ["road ultra race", "paved"],
+        "gravel": ["gravel ultra race", "mixed dirt roads"],
+        "mtb": ["MTB mountain bike ultra", "rough off-road terrain"],
+        "mixed_offroad": ["off-road bikepacking ultra", "mixed rough terrain"],
+    }.get(surface_family, [])
 
 
 def _flag_descriptors(flags: Dict[str, bool]) -> List[str]:
-    from baikpacking.agents.event_context_resolution import _flag_descriptors as _impl
-    return _impl(flags)
+    mapping = {
+        "mountain": "mountainous long climbs",
+        "desert": "desert arid",
+        "remote": "remote minimal resupply",
+        "night": "night riding",
+        "navigation": "navigation GPS route",
+        "cold_hot": "temperature swings",
+    }
+    return [label for key, label in mapping.items() if flags.get(key)]
 
 
 def _metric_descriptors(metrics: Dict[str, Optional[int]]) -> List[str]:
-    from baikpacking.agents.event_context_resolution import _metric_descriptors as _impl
-    return _impl(metrics)
+    descriptors: List[str] = []
+    if metrics.get("distance_km"):
+        descriptors.append(f"{metrics['distance_km']} km")
+    if metrics.get("elevation_m"):
+        descriptors.append(f"{metrics['elevation_m']} m climbing")
+    return descriptors
 
 
 def _build_descriptor_query(
@@ -200,11 +583,67 @@ def _build_descriptor_query(
     event_context: str,
     user_question: str,
 ) -> Dict[str, Any]:
-    return _build_descriptor_query_impl(
-        event_name=event_name,
-        event_context=event_context,
-        user_question=user_question,
+    full_text = "\n".join([event_name or "", event_context or "", user_question or ""]).strip()
+
+    flags = _keyword_flags(full_text)
+    metrics = _extract_metrics(event_context or "")
+    archetype_info = infer_event_archetype(flags)
+
+    archetype = archetype_info["archetype"]
+    surface_family = archetype_info["surface_family"]
+
+    descriptors: List[str] = ["self-supported ultra endurance bikepacking race"]
+
+    if _is_valid_event_name(event_name):
+        _append_unique(descriptors, event_name.strip())
+
+    surface_hint = _query_surface_hint(user_question)
+    if surface_hint == "road":
+        _append_unique(descriptors, "road event")
+        _append_unique(descriptors, "road-oriented setup")
+        _append_unique(descriptors, "faster rolling tyres")
+        _append_unique(descriptors, "avoid MTB-style tyre widths")
+    elif surface_hint == "gravel":
+        _append_unique(descriptors, "gravel event")
+        _append_unique(descriptors, "gravel-oriented setup")
+    elif surface_hint == "trail":
+        _append_unique(descriptors, "trail event")
+        _append_unique(descriptors, "trail-oriented setup")
+
+    for hint in _event_hint_descriptors(event_name):
+        _append_unique(descriptors, hint)
+
+    for descriptor in _surface_descriptors(surface_family):
+        _append_unique(descriptors, descriptor)
+
+    for descriptor in _flag_descriptors(flags):
+        _append_unique(descriptors, descriptor)
+
+    for descriptor in _metric_descriptors(metrics):
+        _append_unique(descriptors, descriptor)
+
+    base_descriptor = ", ".join(descriptors)
+    question_focus = (user_question or "").strip()
+    descriptor_with_intent = (
+        f"{base_descriptor}. Question focus: {question_focus}"
+        if question_focus else base_descriptor
     )
+
+    return {
+        "archetype": archetype,
+        "surface_family": surface_family,
+        "adjacent_archetypes": _ARCHETYPE_ADJACENCY.get(archetype, []),
+        "descriptor_query": base_descriptor,
+        "descriptor_query_with_intent": descriptor_with_intent,
+        "features": {
+            "flags": flags,
+            "metrics": metrics,
+            "archetype_info": archetype_info,
+            "event_name_used": _is_valid_event_name(event_name),
+            "event_hints_used": _event_hint_descriptors(event_name),
+            "surface_hint": surface_hint,
+        },
+    }
 
 
 WRITER_PROMPT = """
@@ -227,7 +666,7 @@ Grounding rules:
 
 Output rules:
 - event must be the requested event_name
-- only mention similar events if the exact event is absent from the retrieved riders
+- if the exact event is absent from rider data, clearly say the setup is based on similar events
 - recommended_setup should contain as many grounded fields as possible without guessing
 """.strip()
 
@@ -238,22 +677,6 @@ writer_agent = Agent(
     output_type=SetupRecommendation,
     system_prompt=WRITER_PROMPT,
 )
-
-
-class _RecommenderAgentCompat:
-    """Compatibility shim for older tests and callers.
-
-    The active runtime entrypoints are recommend_setup() and
-    recommend_setup_with_trace(). This wrapper preserves the old
-    async .run(...) contract by returning an object with .output.
-    """
-
-    async def run(self, user_query: str) -> Any:
-        rec, _trace = await anyio.to_thread.run_sync(recommend_setup_with_trace, user_query)
-        return type("CompatResult", (), {"output": rec})()
-
-
-recommender_agent = _RecommenderAgentCompat()
 
 
 def _build_deps(call_trace: Optional[CallTrace] = None) -> PgVectorSearchDeps:
@@ -268,13 +691,50 @@ def _build_deps(call_trace: Optional[CallTrace] = None) -> PgVectorSearchDeps:
     )
 
 
+def _rider_component_hit_count(riders: List[Any], component_terms: List[str]) -> int:
+    if not riders or not component_terms:
+        return 0
+
+    terms = [t.lower() for t in component_terms if t.strip()]
+    hits = 0
+
+    for r in riders:
+        parts = []
+
+        for value in [
+            getattr(r, "bike_type", None),
+            getattr(r, "wheels", None),
+            getattr(r, "tyres", None),
+            getattr(r, "drivetrain", None),
+            getattr(r, "bags", None),
+            getattr(r, "sleep_system", None),
+        ]:
+            if isinstance(value, str) and value.strip():
+                parts.append(value)
+
+        for item in getattr(r, "key_items", None) or []:
+            if isinstance(item, str) and item.strip():
+                parts.append(item)
+
+        for c in getattr(r, "chunks", None) or []:
+            text = getattr(c, "text", None) or getattr(c, "content", None) or ""
+            if text:
+                parts.append(text)
+
+        searchable = " ".join(parts).lower()
+
+        if any(term in searchable for term in terms):
+            hits += 1
+
+    return hits
+
+
 def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, CallTrace]:
     with logfire.span("recommender.run", user_query=user_query):
         trace = CallTrace()
         deps = _build_deps(call_trace=trace)
 
-        event_resolution = resolve_event(user_query)
-        event_name = event_resolution.display_name
+        event_name = _extract_event_name(user_query)
         intent = _classify_query_intent(user_query)
 
         record_trace_call(
@@ -285,33 +745,41 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
             elapsed_ms=0.0,
         )
 
-        event_context_summary = time_and_record(
+        event_context_obj = time_and_record(
             deps=deps,
             tool_name="event_web_search",
             args={"event_title": event_name},
-            fn=lambda: fetch_event_context_summary(
-                event_resolution=event_resolution,
+            fn=lambda: run_event_web_search_sync(
+                event_title=event_name,
                 deps=deps,
             ),
         )
 
-        event_context_text = event_context_summary.web_context_text
+        event_context_text = _event_context_to_text(event_context_obj)
 
-        retrieval_plan = build_retrieval_plan(
-            event_resolution=event_resolution,
-            event_context_summary=event_context_summary,
-            intent=intent,
-            user_query=user_query,
+        descriptor = _build_descriptor_query(
+            event_name=event_name,
+            event_context=event_context_text,
+            user_question=user_query,
         )
 
-        first_query = retrieval_plan.primary_query
-        second_query = retrieval_plan.fallback_query
+        retrieval_bundle = _build_retrieval_intent_bundle(
+            descriptor=descriptor,
+            intent=intent,
+        )
+
+        if intent.component != "full_setup" and retrieval_bundle.component_query:
+            first_query = retrieval_bundle.component_query
+            second_query = retrieval_bundle.broad_query
+        else:
+            first_query = retrieval_bundle.broad_query
+            second_query = retrieval_bundle.component_query
 
         top_k_riders = DEFAULT_TOP_K_RIDERS
         max_chunks_per_rider = DEFAULT_MAX_CHUNKS_PER_RIDER
         top_k_chunks = DEFAULT_TOP_K_CHUNKS
 
-        retrieval_query = retrieval_plan.primary_query
+        retrieval_query = first_query
 
         record_trace_call(
             deps=deps,
@@ -432,65 +900,6 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
         if not riders:
             raise RuntimeError("No similar riders returned; cannot produce grounded recommendation.")
 
-        grounding = _infer_retrieval_grounding(
-            event_resolution=event_resolution,
-            event_context_summary=event_context_summary,
-            riders=riders,
-            fallback_used=bool(second_query and retrieval_query == second_query),
-        )
-
-        retrieval_result = RetrievalExecutionResult(
-            riders=riders,
-            used_query=retrieval_query,
-            fallback_used=bool(second_query and retrieval_query == second_query),
-            fallback_reason=None,
-            retrieval_source=grounding["retrieval_source"],
-            exact_event_hit_count=grounding["exact_event_hit_count"],
-            matched_event_name=grounding["matched_event_name"],
-            component_hit_count=0,
-        )
-
-        evidence_summary = summarize_evidence(
-            riders=riders,
-            intent=intent,
-            event_resolution=event_resolution,
-            retrieval_result=retrieval_result,
-        )
-
-        policy = select_policy(
-            event_match_type=event_resolution.match_type,
-            matched_event_name=retrieval_result.matched_event_name,
-            retrieval_source=retrieval_result.retrieval_source,
-            exact_event_hit_count=retrieval_result.exact_event_hit_count,
-            evidence_strength=evidence_summary.evidence_strength,
-        )
-
-        record_trace_call(
-            deps=deps,
-            tool_name="evidence_summary",
-            args={
-                "query_component": intent.component,
-                "event_name": event_name,
-            },
-            result=evidence_summary.model_dump(),
-            elapsed_ms=0.0,
-        )
-
-        record_trace_call(
-            deps=deps,
-            tool_name="policy_selection",
-            args={
-                "event_name": event_name,
-                "event_match_type": event_resolution.match_type,
-                "matched_event_name": retrieval_result.matched_event_name,
-                "retrieval_source": retrieval_result.retrieval_source,
-                "exact_event_hit_count": retrieval_result.exact_event_hit_count,
-                "evidence_strength": evidence_summary.evidence_strength,
-            },
-            result=policy.model_dump(),
-            elapsed_ms=0.0,
-        )
-
         compact_riders = _compact_riders(riders)
 
         writer_input = WriterInput(
@@ -510,7 +919,6 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
             rec=rec,
             riders=riders,
             query_component=intent.component,
-            policy=policy,
         )
 
         if not rec.event or not rec.event.strip():

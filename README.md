@@ -1,297 +1,279 @@
-# bAIpacking Agent
+# 🚴‍♂️ bAIpacking Agent
 
-Bikepacking recommendation system built around a real end-to-end knowledge base pipeline, grounded retrieval, and LLM-assisted recommendation generation.
+An AI agent for exploring bikepacking setups using structured data, retrieval, and multi-tool reasoning.
 
-## Problem
+---
 
-Bikepacking race setup advice is scattered across article pages, rider interviews, and equipment lists. A reviewer or rider usually wants answers like:
+## 📌 Overview
 
-- What bike and tire setup worked for a similar event?
-- What drivetrain or wheel choice is common for this terrain?
-- Which riders used a setup close to my event or constraints?
+This project develops an LLM-powered agent capable of answering questions about bikepacking race setups (bikes, gear, riders, events).
 
-This project turns that unstructured material into a structured database so it can be searched, filtered, embedded, and used for grounded recommendations.
+The agent is built on a **domain-specific knowledge base extracted from DotWatcher.cc (“Bikes of…” articles)** and stored entirely in **PostgreSQL**, using:
 
-## What The System Does
+- **Relational tables** for structured rider data  
+- **pgvector** for semantic embeddings and similarity search  
 
-The project builds a searchable bikepacking knowledge base from DotWatcher [_“Bikes of …”_](https://dotwatcher.cc/features/bikes-of?) articles, then uses that knowledge base at runtime to produce recommendations for new queries.
+The system combines **structured querying, vector retrieval, and agentic reasoning** to produce grounded, explainable recommendations.
 
-For now, the system is best understood as a structured pipeline with LLM-assisted generation, not as a fully autonomous agent:
+---
 
-- deterministic ingestion and cleaning
-- database loading and embedding
-- retrieval over structured and vector-backed data
-- policy-based fallback when evidence is weak
-- one LLM writer stage that turns retrieved evidence into a final recommendation
+## 🎯 Problem Description
 
-The result is a grounded recommender that is more transparent than a pure chat app and more flexible than a fixed rules engine.
+Bikepacking racers share detailed equipment lists online. This information is spread across dozens of DotWatcher articles and cannot be queried efficiently.
 
-## Why This Project Is Interesting
+### The problem
 
-- It has a real end-to-end KB build path, not just a demo prompt.
-- Retrieval is event-aware and falls back safely when exact evidence is missing.
-- The runtime path is modular, traceable, and testable.
-- Evaluation exists for retrieval and there is an offline response-eval path, even though the latter is still less mature.
+Cyclists cannot easily explore setups from previous riders to decide what bike, components, bags, or electronics to use for an upcoming race — especially if they are new to the bikepacking world.
 
-## Active Architecture
+### The bAIpacking Agent solves this by
 
-### KB Build Pipeline
+- Scraping and cleaning *“Bikes of…”* articles  
+- Parsing riders into a normalized Pydantic schema  
+- Storing riders and embeddings in **Postgres + pgvector**  
+- Providing an LLM agent with multiple tools for:
+  - SQL-based structured search
+  - Vector similarity search
+  - Filtering and reasoning
+  - Model-based evaluation of retrieval quality
 
-The active knowledge-base path is:
+Example questions the agent can answer:
 
-```text
-src/baikpacking/scraper/clean_json.py
--> src/baikpacking/pipelines/scrape_dotwatcher.py
--> src/baikpacking/db/data_loader.py
--> src/baikpacking/pipelines/embed_index.py
--> src/baikpacking/embedding/embed.py
--> src/baikpacking/tools/riders.py
-```
+> *“Recommend a setup for a lightweight hardtail rider doing the GranGuanche Trail.”*  
+> *“I'm riding Transiberica — what wheels should I use?”*
 
-What each stage does:
+This is a real-world application combining **structured + unstructured data**, **RAG**, **evaluation**, and **monitoring**.
 
-- `src/baikpacking/scraper/clean_json.py`: cleans and normalizes DotWatcher article text into rider records
-- `src/baikpacking/pipelines/scrape_dotwatcher.py`: scrapes new DotWatcher “Bikes of …” pages and writes snapshots
-- `src/baikpacking/db/data_loader.py`: loads cleaned rider data into PostgreSQL
-- `src/baikpacking/pipelines/embed_index.py`: embeds riders into the vector index
-- `src/baikpacking/embedding/embed.py`: talks to Ollama and builds embedding vectors
-- `src/baikpacking/tools/riders.py`: runtime retrieval over riders and evidence chunks
 
-### Runtime Recommender
+# 🧠 Knowledge Base
 
-The current runtime recommender is centered on:
+The core of the bAIpacking Agent is a **domain-specific knowledge base (KB)** built from historical bikepacking race data.
 
-- `src/baikpacking/agents/recommender_agent.py`
-- supporting modules under `src/baikpacking/agents/`
-- runtime entrypoint `src/baikpacking/scripts/run_recommender.py`
+## What the Knowledge Base Contains
 
-The recommender is a staged system. It performs:
+The KB is derived from DotWatcher.cc *“Bikes of …”* articles and represents individual riders and their setups, normalized into a structured schema.
 
-1. event resolution
-2. query intent classification
-3. event context resolution
-4. retrieval planning
-5. pgvector / structured rider search
-6. evidence summarization
-7. policy selection and fallback
-8. postprocessing and output validation
-9. final LLM-assisted response writing
+Each rider record includes (when available):
 
-The tools are not an open-ended autonomous loop. They are modular stages with clear responsibilities and trace logging.
+- Rider metadata (name, age, location)
+- Event context (race name, year, article source)
+- Bike and frame details (bike model, frame type, material)
+- Components (drivetrain, wheels, tyres, electronics)
+- Gear and kit (bags, sleep system, navigation, power)
+- Free-text descriptions preserved for semantic retrieval
 
-### Supporting Modules
+This design supports both **deterministic filtering** and **semantic similarity search**.
 
-The runtime path uses these modules heavily:
+---
 
-- `src/baikpacking/agents/event_resolution.py`
-- `src/baikpacking/agents/event_context_resolution.py`
-- `src/baikpacking/agents/query_intent.py`
-- `src/baikpacking/agents/retrieval_planning.py`
-- `src/baikpacking/agents/evidence_summary.py`
-- `src/baikpacking/agents/policy.py`
-- `src/baikpacking/agents/postprocess.py`
-- `src/baikpacking/agents/output_validation.py`
-- `src/baikpacking/tools/pg_vector_search.py`
-- `src/baikpacking/tools/riders.py`
+## Architecture of the Knowledge Base
 
-## Tools And Components
+The knowledge base is stored **entirely in PostgreSQL**, using two tightly coupled layers:
 
-- `PostgreSQL + pgvector`: stores structured riders and vector embeddings
-- `Ollama`: provides the embedding model used during KB indexing
-- `Pydantic AI`: wraps the writer step and instrumentation
-- `Logfire`: captures tracing when configured
-- `Docker Compose`: runs local Postgres
-- `uv`: reproducible Python dependency management and execution
+### 1. PostgreSQL (structured storage)
 
-## Repository Structure
+- Acts as the **single source of truth**
+- Stores cleaned and normalized rider records
+- Enables deterministic queries:
+  - Filters (tyre width, frame type, electronic shifting, year, event)
+  - Aggregations (component frequency, distributions)
+  - Debugging and traceability
 
-- `src/baikpacking/agents/`: runtime orchestration, policy, validation, and writer logic
-- `src/baikpacking/pipelines/`: KB ingestion and embedding pipelines
-- `src/baikpacking/scraper/`: scraping and cleaning of DotWatcher data
-- `src/baikpacking/db/`: schema, loaders, and DB connections
-- `src/baikpacking/embedding/`: embedding config and Ollama client
-- `src/baikpacking/tools/`: retrieval, tracing, and event-context utilities
-- `src/baikpacking/scripts/`: runnable entrypoints
-- `tests/`: unit and smoke tests for the active code path
-- `data/`: current snapshots, cached eval artifacts, and generated outputs
-- `archive/`: legacy retrieval, eval, notebooks, and older code paths kept for reference
+### 2. pgvector (semantic layer)
 
-## Setup
+- Stores vector embeddings of rider records inside Postgres
+- Each embedding row is linked to a rider record via a stable ID
+- Embeddings are generated from compact textual representations of setups
 
-### 1. Install Dependencies
+Typical use cases:
 
-Use the lockfile-based workflow:
+- Semantic similarity search (“riders similar to X”)
+- Retrieval-augmented generation (RAG)
+- Candidate selection before agent reasoning
 
-```bash
-uv sync
-```
+This **single-database architecture** avoids operational complexity while enabling **hybrid retrieval** (SQL + vectors).
 
-### 2. Configure Environment
+---
 
-Create or edit `.env` with your local values. The code reads these common variables:
+## Ingestion Pipeline
 
-- `DATABASE_URL`
-- `EMB_EMBEDDING_MODEL`
-- `OLLAMA_HOST`
-- `LOG_LEVEL`
-- `LOGFIRE_TOKEN`
-- `AGENT_WRITER_MODEL`
-- `EVENT_CONTEXT_CACHE_PATH`
-- `EVENT_CONTEXT_CACHE_TTL_S`
+The ingestion process is designed as a **reproducible, modular pipeline**.
 
-Typical local defaults are already present in code, but the project still expects a usable local database and embedding runtime.
+### Scraping
 
-### 3. Start Local Services
+- DotWatcher.cc articles are scraped and stored as raw JSON
+- Raw articles are preserved for traceability
 
-```bash
-make pg-up
-make ollama-up
-```
+### Parsing & Cleaning
 
-If `EMB_EMBEDDING_MODEL` is not already set, export it before starting Ollama:
+- Articles are parsed into individual rider sections
+- Noise (navigation text, headers, duplicates) is removed
+- Fields are normalized (tyre width, wheel size, electronics, etc.)
 
-```bash
-export EMB_EMBEDDING_MODEL=mxbai-embed-large:335m
-```
+### Schema Validation
 
-## How To Run The KB Pipeline
+- Each rider is validated against a Pydantic model
+- Missing or ambiguous fields are allowed but explicit
 
-The shortest path is:
+### Persistence
 
-```bash
-make kb-update
-```
+- Clean rider records are inserted into PostgreSQL
+- Textual representations are embedded
+- Embeddings are stored in Postgres using **pgvector**
 
-That command runs the active incremental KB flow:
+### Linking
 
-```text
-scrape -> clean -> load -> embed
-```
+- Rider table IDs and embedding table IDs are explicitly linked
+- Enables explainability and result inspection
 
-Useful subcommands:
+This separation ensures:
 
-```bash
-make kb-scrape   # scrape new DotWatcher articles
-make kb-clean    # clean the latest raw snapshot
-make kb-load     # load the latest cleaned snapshot into Postgres
-make kb-embed    # embed riders into pgvector
-make kb-check    # show latest snapshot files
-make kb-status   # show row counts and missing embeddings
-```
+- Clear responsibility between scraping, cleaning, storage, and retrieval
+- Easy re-ingestion when schemas or embedding models change
 
-For a one-shot local bootstrap:
+---
 
-```bash
-make dev
-```
+## How the Agent Uses the Knowledge Base
 
-## How To Run The Recommender
+The LLM agent does **not** answer questions from parametric knowledge alone.
 
-Run the current runtime entrypoint with:
+Instead, it:
 
-```bash
-uv run python -m baikpacking.scripts.run_recommender
-```
+1. Retrieves candidate riders using:
+   - SQL filters
+   - Vector similarity search (pgvector)
+2. Inspects retrieved evidence (structured + text)
+3. Reasons over real historical setups
+4. Produces a grounded, explainable answer
 
-This:
+This prevents hallucinated configurations and keeps recommendations traceable.
 
-- runs the recommender on a sample query
-- prints the recommendation and tool trace
-- appends a JSONL row to `data/eval/sample_eval_rows.jsonl`
-
-The recommender implementation lives in:
-
-- `src/baikpacking/agents/recommender_agent.py`
-- `src/baikpacking/scripts/run_recommender.py`
-
-## Testing
-
-The active test suite is under `tests/`.
-
-Run all tests:
-
-```bash
-uv run pytest
-```
-
-Run a focused smoke test for the runtime recommender:
-
-```bash
-uv run pytest tests/test_recommender.py -q
-```
-
-The tests cover event resolution, query intent, retrieval planning, policy behavior, evidence summarization, output validation, and a recommender smoke path.
+---
 
 ## Evaluation
 
-Evaluation is split into two levels.
-
-### Current Active Evaluation
-
-The current runtime evaluation artifact is the sample JSONL row written by:
-
-```bash
-uv run python -m baikpacking.scripts.run_recommender
-```
-
-That file captures:
-
-- the user question
-- the model answer
-- the structured output
-- the tool trace
-
-This is useful for offline inspection and response-quality review, but it is still a lightweight evaluation path.
-
 ### Retrieval Evaluation
 
-To DO
+This module evaluates and improves **retrieval quality** for a bikepacking / ultracycling setup recommender.
 
-## Monitoring And Tracing
+Evaluation is **retrieval-first**: given a natural-language query, relevant rider setups should appear as early as possible in the ranked list.
 
-The project has developer-facing tracing, not a full production monitoring stack.
+---
 
-What is available:
+### Data & Index
 
-- `src/baikpacking/logging_config.py` configures standard logging and Logfire
-- `LOGFIRE_TOKEN` enables sending traces to Logfire
-- `pydantic_ai` instrumentation captures agent runs and tool calls
-- `src/baikpacking/tools/call_trace.py` records tool-call traces inside the runtime path
-- `src/baikpacking/scripts/run_recommender.py` prints the tool trace and stores it in JSONL
-- `make kb-status` gives a quick DB health check by counting riders and embeddings
+- **Source**: Parsed rider setup articles (DotWatcher)
+- **Storage**: PostgreSQL + pgvector
+- **Indexing unit**: Text chunks derived from rider setups
 
-Typical inspection flow:
+Stored fields include:
+
+- `rider_id` (stable document ID)
+- `text` (compact setup description)
+- Structured attributes:
+  - `event_key`
+  - `frame_type`
+  - `tyre_width`
+  - `electronic_shifting`
+  - …
+
+**Important**: A single rider may produce multiple chunks. Deduplication is always done by `rider_id`.
+
+---
+
+### Queries & Ground Truth
+
+- `queries.jsonl`: Natural-language queries
+- `qrels.jsonl`: Manually labeled relevant `rider_id`s
+
+Relevance:
+
+- **Binary relevance** for retrieval metrics
+- **Graded relevance** reserved for later (e.g. nDCG)
+
+---
+
+### Retrieval Pipeline (per query)
+
+1. **Dense Retrieval**
+   - Embedding-based search via pgvector
+   - Oversampling when reranking is enabled
+   - Latency measured independently
+
+2. **Deduplication**
+   - Deduplicate by `rider_id`
+   - Keep the chunk with the best similarity score
+
+3. **Baseline Ranking**
+   - Ranked purely by vector similarity
+   - Acts as the safety baseline
+
+4. **Deterministic Reranking**
+   - Rule-based, payload-aware reranker
+   - Soft boosts (tyres, gearing, shifting, event match)
+   - Global clamp ensures similarity dominates
+
+5. **Safe Fallback Logic**
+   - If reranking hurts hitrate@k → fallback
+   - If hitrate ties but MRR@k decreases → fallback
+
+This guarantees **no metric regression** during tuning.
+
+---
+
+# 🚀 How to launch the system
+
+The project is designed to be run via a **Makefile**, ensuring reproducibility and minimal setup friction.
+
+## Prerequisites
+
+- Docker & Docker Compose
+- Python 3.11+
+- `make`
+- An OpenAI-compatible API key
+
+## Launching the infrastructure
+
+Start the required infrastructure (Postgres + pgvector) with:
 
 ```bash
-uv run python -m baikpacking.scripts.run_recommender
-make kb-status
+make pg-up
 ```
 
-If `LOGFIRE_TOKEN` is configured, inspect traces in the Logfire project linked to that token. If it is not configured, tracing remains local.
+## Setting up embeddings with Ollama (local)
 
-## Reproducibility
+If you plan to generate embeddings locally using Ollama, start the Ollama server and pull the embedding model defined in the .env file:
 
-To reproduce the current local setup:
 
-1. Install dependencies with `uv sync`
-2. Start Postgres with `make pg-up`
-3. Start Ollama with `make ollama-up`
-4. Set the needed environment variables in `.env`
-5. Build or refresh the KB with `make kb-update`
-6. Run the recommender with `uv run python -m baikpacking.scripts.run_recommender`
-7. Run tests with `uv run pytest`
+```bash
+make ollama-up
+```
 
-This is intentionally a local, reproducible workflow rather than a cloud-deployed system.
+- Check that Ollama is installed and available
 
-## Limitations And Future Improvements
+- Start the Ollama server (ollama serve) if it is not already running
 
-- The system is not fully agentic; it is a structured pipeline with an LLM writer stage.
-- Final answers are grounded, but source-level citation support is still limited.
-- Response evaluation exists, but it is less mature than retrieval evaluation.
-- Runtime and eval retrieval backends are not fully unified.
-- Monitoring is present through logs and Logfire, but the documentation and production controls are still thin.
+- Verify the server is responding on http://localhost:11434
 
-## Notes For Reviewers
+- Pull the embedding model specified in EMB_EMBEDDING_MODEL
+(e.g. `mxbai-embed-large:335m`)
 
-- The active repo is centered on the cleaned KB pipeline and the runtime recommender path for now.
 
+## Updating the knowledge base (end-to-end)
+
+To run the full incremental knowledge base update pipeline, execute:
+
+make kb-update
+
+
+This command performs, in order:
+
+Scraping
+Fetches new “Bikes of…” articles from DotWatcher (incremental; stops when no new content is found).
+
+Cleaning
+Normalizes and cleans only the newly scraped articles, producing a new-only cleaned snapshot.
+
+Database loading
+Inserts only new articles and riders into PostgreSQL (idempotent, no duplicates).
+
+If no new articles are found, the pipeline exits early without re-processing or touching the database.
