@@ -61,7 +61,7 @@ class EventContextSummary(BaseModel):
     climate_notes: Optional[str] = None
     resupply_notes: Optional[str] = None
 
-    constraints: List[str] = Field(default_factory=list)
+    constraints: Optional[List[str]] = None
 
     summary: Optional[str] = None
 
@@ -71,6 +71,8 @@ class EventContextSummary(BaseModel):
             raise ValueError("distance_km provided without distance_evidence")
         if self.total_climbing_m is not None and not self.climbing_evidence:
             raise ValueError("total_climbing_m provided without climbing_evidence")
+        if self.constraints is None:
+            self.constraints = []
         return self
 
 

@@ -7,6 +7,7 @@ class EventResolutionResult(BaseModel):
     raw_query_event: Optional[str] = None
     canonical_name: Optional[str] = None
     display_name: str = "Unknown event"
+    requested_count: Optional[int] = None
     match_type: str = "unknown"
     confidence: float = 0.0
     is_trusted_exact: bool = False
@@ -32,6 +33,7 @@ class RetrievalPlan(BaseModel):
     primary_query: str
     fallback_query: Optional[str] = None
     fallback_reasoning: Optional[str] = None
+    intent_bundle: Any = None
 
 
 class RetrievalExecutionResult(BaseModel):
@@ -39,6 +41,9 @@ class RetrievalExecutionResult(BaseModel):
     used_query: str
     fallback_used: bool = False
     fallback_reason: Optional[str] = None
+    retrieval_source: str = "unknown_global"
+    exact_event_hit_count: int = 0
+    matched_event_name: Optional[str] = None
     component_hit_count: int = 0
 
 
