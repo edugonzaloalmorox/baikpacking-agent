@@ -1,5 +1,8 @@
+import json
+import logging
 import os
 import re
+import time
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -49,6 +52,7 @@ from baikpacking.tools.riders import run_search_similar_riders
 
 load_dotenv()
 setup_logging()
+logger = logging.getLogger(__name__)
 
 
 class AgentSettings(BaseSettings):
@@ -207,6 +211,112 @@ def _build_descriptor_query(
     )
 
 
+def _clean_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split()).strip()
+
+
+def _writer_missing_fields(rec: Optional[SetupRecommendation]) -> List[str]:
+    if rec is None or rec.recommended_setup is None:
+        return ["recommended_setup"]
+
+    missing: List[str] = []
+    for field_name in ["bike_type", "wheels", "lights", "tyres", "drivetrain", "bags", "sleep_system"]:
+        if not _clean_text(getattr(rec.recommended_setup, field_name, None)):
+            missing.append(field_name)
+    return missing
+
+
+def _writer_validation_issues(rec: Optional[SetupRecommendation]) -> List[str]:
+    issues: List[str] = []
+    if rec is None:
+        return ["no_writer_output"]
+
+    if not _clean_text(rec.summary):
+        issues.append("empty_summary")
+    if not _clean_text(rec.reasoning):
+        issues.append("empty_reasoning")
+    if rec.recommended_setup is None or rec.recommended_setup.is_empty():
+        issues.append("empty_recommended_setup")
+    return issues
+
+
+def _writer_snapshot(rec: Optional[SetupRecommendation]) -> Optional[Dict[str, Any]]:
+    if rec is None:
+        return None
+
+    return {
+        "event": rec.event,
+        "summary": rec.summary,
+        "reasoning": rec.reasoning,
+        "recommended_setup": rec.recommended_setup.model_dump() if rec.recommended_setup else None,
+        "missing_fields": _writer_missing_fields(rec),
+    }
+
+
+def _build_writer_repair_prompt(
+    writer_input_json: str,
+    first_draft: Optional[SetupRecommendation],
+    issues: List[str],
+    error_text: Optional[str] = None,
+) -> str:
+    payload = {
+        "issues": issues,
+        "error": error_text,
+        "first_draft": _writer_snapshot(first_draft),
+        "writer_input": json.loads(writer_input_json),
+    }
+    return (
+        "Repair the previous bikepacking recommendation draft.\n"
+        "Return only valid JSON matching SetupRecommendation.\n"
+        "Keep all grounded claims tied to the provided similar_riders.\n"
+        "Do not invent gear, brands, or specs.\n"
+        "If a field still cannot be grounded, leave it empty/null and explain that in reasoning.\n\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def _run_writer_call(
+    prompt: str,
+    *,
+    deps: Any,
+    stage: str,
+    args: Dict[str, Any],
+) -> Tuple[SetupRecommendation, float]:
+    """Run one writer call and record its timing in the call trace."""
+    t0 = time.perf_counter()
+    try:
+        result = writer_agent.run_sync(prompt).output
+    except Exception as exc:
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        record_trace_call(
+            deps=deps,
+            tool_name=stage,
+            args=args,
+            result={
+                "ok": False,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+            elapsed_ms=elapsed_ms,
+        )
+        raise
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    record_trace_call(
+        deps=deps,
+        tool_name=stage,
+        args=args,
+        result={
+            "ok": True,
+            "output_type": type(result).__name__,
+        },
+        elapsed_ms=elapsed_ms,
+    )
+    return result, elapsed_ms
+
+
 WRITER_PROMPT = """
 You are a bikepacking equipment and ultra-distance cycling expert.
 
@@ -237,6 +347,8 @@ writer_agent = Agent(
     model=writer_model,
     output_type=SetupRecommendation,
     system_prompt=WRITER_PROMPT,
+    retries=0,
+    output_retries=0,
 )
 
 
@@ -503,20 +615,157 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
             similar_riders=compact_riders,
         )
 
-        rec = writer_agent.run_sync(writer_input.model_dump_json(indent=2)).output
-        rec.similar_riders = riders
+        writer_input_json = writer_input.model_dump_json(indent=2)
+        writer_call_count = 0
+        writer_total_ms = 0.0
+        writer_first_pass_ok = False
+        writer_validation_failed = False
+        writer_second_pass_triggered = False
+        writer_second_pass_reason: Optional[str] = None
+        first_pass_error: Optional[str] = None
+        first_pass_issues: List[str] = []
+        final_rec: Optional[SetupRecommendation] = None
 
-        rec = _fill_requested_component_from_riders(
-            rec=rec,
-            riders=riders,
-            query_component=intent.component,
-            policy=policy,
+        def _finalize_writer_output(output_rec: SetupRecommendation) -> SetupRecommendation:
+            output_rec.similar_riders = riders
+            output_rec = _fill_requested_component_from_riders(
+                rec=output_rec,
+                riders=riders,
+                query_component=intent.component,
+                policy=policy,
+            )
+            if not output_rec.event or not output_rec.event.strip():
+                output_rec.event = event_name
+            return _postprocess_recommendation(output_rec)
+
+        try:
+            writer_call_count += 1
+            first_rec, first_elapsed_ms = _run_writer_call(
+                writer_input_json,
+                deps=deps,
+                stage="writer_call",
+                args={
+                    "pass": 1,
+                    "query_component": intent.component,
+                    "component_hit_count": component_hit_count,
+                    "descriptor_query": retrieval_query,
+                },
+            )
+            writer_total_ms += first_elapsed_ms
+            final_rec = _finalize_writer_output(first_rec)
+            first_pass_issues = _writer_validation_issues(final_rec)
+            writer_first_pass_ok = not first_pass_issues
+            writer_validation_failed = not writer_first_pass_ok
+        except Exception as exc:
+            writer_validation_failed = True
+            first_pass_error = f"{type(exc).__name__}: {exc}"
+            first_pass_issues = [first_pass_error]
+            logger.warning("First writer pass failed for query=%r: %s", user_query, first_pass_error)
+
+        if writer_validation_failed:
+            writer_second_pass_triggered = True
+            writer_second_pass_reason = (
+                first_pass_error
+                or ("validation_failed:" + ",".join(first_pass_issues) if first_pass_issues else "validation_failed")
+            )
+
+            record_trace_call(
+                deps=deps,
+                tool_name="writer_repair_triggered",
+                args={
+                    "query_component": intent.component,
+                    "component_hit_count": component_hit_count,
+                    "descriptor_query": retrieval_query,
+                },
+                result={
+                    "reason": writer_second_pass_reason,
+                    "issues": first_pass_issues,
+                },
+                elapsed_ms=0.0,
+            )
+
+            repair_prompt = _build_writer_repair_prompt(
+                writer_input_json=writer_input_json,
+                first_draft=final_rec,
+                issues=first_pass_issues,
+                error_text=first_pass_error,
+            )
+
+            try:
+                writer_call_count += 1
+                repaired_rec, repair_elapsed_ms = _run_writer_call(
+                    repair_prompt,
+                    deps=deps,
+                    stage="writer_repair_call",
+                    args={
+                        "pass": 2,
+                        "reason": writer_second_pass_reason,
+                        "query_component": intent.component,
+                        "component_hit_count": component_hit_count,
+                        "descriptor_query": retrieval_query,
+                    },
+                )
+                writer_total_ms += repair_elapsed_ms
+                final_rec = _finalize_writer_output(repaired_rec)
+                repair_issues = _writer_validation_issues(final_rec)
+                if repair_issues:
+                    writer_validation_failed = True
+                    writer_second_pass_reason = "repair_validation_failed:" + ",".join(repair_issues)
+                else:
+                    writer_validation_failed = False
+            except Exception as exc:
+                writer_validation_failed = True
+                writer_second_pass_reason = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "Writer repair pass failed for query=%r: %s",
+                    user_query,
+                    writer_second_pass_reason,
+                )
+                if final_rec is None:
+                    raise
+
+        if final_rec is None:
+            raise RuntimeError("Writer failed to produce a recommendation.")
+
+        record_trace_call(
+            deps=deps,
+            tool_name="writer_validation",
+            args={
+                "query_component": intent.component,
+                "component_hit_count": component_hit_count,
+            },
+            result={
+                "writer_call_count": writer_call_count,
+                "writer_first_pass_ok": writer_first_pass_ok,
+                "writer_validation_failed": writer_validation_failed,
+                "writer_second_pass_triggered": writer_second_pass_triggered,
+                "writer_second_pass_reason": writer_second_pass_reason,
+                "missing_fields": _writer_missing_fields(final_rec),
+                "issues": first_pass_issues,
+            },
+            elapsed_ms=0.0,
         )
 
-        if not rec.event or not rec.event.strip():
-            rec.event = event_name
+        record_trace_call(
+            deps=deps,
+            tool_name="writer_stage_summary",
+            args={
+                "query_component": intent.component,
+                "component_hit_count": component_hit_count,
+                "descriptor_query": retrieval_query,
+            },
+            result={
+                "writer_call_count": writer_call_count,
+                "writer_first_pass_ok": writer_first_pass_ok,
+                "writer_validation_failed": writer_validation_failed,
+                "writer_second_pass_triggered": writer_second_pass_triggered,
+                "writer_second_pass_reason": writer_second_pass_reason,
+                "writer_total_ms": round(writer_total_ms, 3),
+            },
+            elapsed_ms=writer_total_ms,
+        )
 
-        return _postprocess_recommendation(rec), trace
+        return final_rec, trace
 
         
         
