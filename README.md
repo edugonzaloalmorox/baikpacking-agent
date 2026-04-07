@@ -243,6 +243,20 @@ That file captures:
 
 This is useful for offline inspection and response-quality review, but it is still a lightweight evaluation path.
 
+The manual scenario runner writes a richer per-run record to `data/eval/scenario_runs.jsonl` from:
+
+```bash
+uv run python -m baikpacking.scripts.run_eval_scenarios
+```
+
+Those rows now include the scenario contract fields, runtime policy/retrieval metadata, content assertions, event-alignment assertions, and failure classification such as `output_schema_failure`.
+
+For a quick local view of that file, launch the eval dashboard:
+
+```bash
+streamlit run src/baikpacking/apps/eval_dashboard.py
+```
+
 ### Retrieval Evaluation
 
 To DO
@@ -294,4 +308,3 @@ This is intentionally a local, reproducible workflow rather than a cloud-deploye
 ## Notes For Reviewers
 
 - The active repo is centered on the cleaned KB pipeline and the runtime recommender path for now.
-
