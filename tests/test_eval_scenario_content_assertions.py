@@ -4,6 +4,8 @@ from baikpacking.scripts.run_eval_scenarios import (
     evaluate_content_assertions,
     evaluate_event_alignment_assertions,
     extract_run_row,
+    load_scenarios,
+    run_one_scenario,
 )
 
 
@@ -204,6 +206,28 @@ def test_non_full_setup_skips_checks():
     assert result["content_assertion_issue_count"] == 0
 
 
+def test_must_mention_and_must_not_do_are_checked():
+    result = evaluate_content_assertions(
+        {
+            "expected_intent": "full_setup",
+            "intent_component": "full_setup",
+            "must_mention": ["Atlas Mountain Race", "gravel bike"],
+            "must_not_do": ["invent unsupported rider evidence"],
+            "summary": "For Atlas Mountain Race, a gravel bike is a solid baseline.",
+            "reasoning": "The grounded evidence does not invent unsupported rider evidence.",
+            "recommended_setup": {
+                "bike_type": "gravel bike",
+                "tyres": "45mm",
+                "bags": "frame bag",
+                "drivetrain": "GRX 1x",
+            },
+        }
+    )
+
+    assert result["content_assertions_passed"] is False
+    assert "forbidden_phrase:invent unsupported rider evidence" in result["content_assertion_issues"]
+
+
 def test_exact_known_event_with_zero_hits_is_flagged():
     result = evaluate_event_alignment_assertions(
         _event_run(exact_event_hit_count=0, retrieval_source="similar_event")
@@ -353,3 +377,86 @@ def test_extract_run_row_merges_content_assertions():
     assert row["content_assertion_issues"] == []
     assert row["event_alignment_assertions_passed"] is True
     assert row["event_alignment_issues"] == []
+
+
+def test_load_scenarios_normalizes_question_and_validates_schema(tmp_path):
+    path = tmp_path / "manual_scenarios.yaml"
+    path.write_text(
+        """
+scenarios:
+  - id: sample
+    question: "What tyres should I use for Atlas Mountain Race?"
+    expected_event: "Atlas Mountain Race"
+    expected_event_match_type: "exact"
+    expected_intent: "component_tyres"
+    expected_component: "tyres"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention: ["Atlas Mountain Race", "tyre"]
+    must_not_do: ["invent unsupported rider evidence"]
+        """.strip()
+    )
+
+    scenarios = load_scenarios(path)
+
+    assert len(scenarios) == 1
+    assert scenarios[0]["query"] == "What tyres should I use for Atlas Mountain Race?"
+    assert scenarios[0]["question"] == "What tyres should I use for Atlas Mountain Race?"
+    assert scenarios[0]["expected_policy_mode"] == "strict_grounded"
+
+
+def test_load_scenarios_rejects_missing_required_contract_field(tmp_path):
+    path = tmp_path / "manual_scenarios.yaml"
+    path.write_text(
+        """
+scenarios:
+  - id: sample
+    question: "What tyres should I use for Atlas Mountain Race?"
+    expected_event: "Atlas Mountain Race"
+    expected_event_match_type: "exact"
+    expected_intent: "component_tyres"
+    expected_component: "tyres"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    must_mention: ["Atlas Mountain Race", "tyre"]
+    must_not_do: ["invent unsupported rider evidence"]
+        """.strip()
+    )
+
+    try:
+        load_scenarios(path)
+    except ValueError as exc:
+        assert "expected_guardedness" in str(exc)
+    else:
+        raise AssertionError("Expected load_scenarios to reject the incomplete scenario contract")
+
+
+def test_run_one_scenario_marks_output_schema_failures(monkeypatch):
+    from baikpacking.scripts import run_eval_scenarios as mod
+
+    def broken_recommender(_query):
+        raise RuntimeError("UnexpectedModelBehavior: output validation failed for SetupRecommendation")
+
+    monkeypatch.setattr(mod, "recommend_setup_with_trace", broken_recommender)
+
+    row = run_one_scenario(
+        {
+            "id": "sample",
+            "question": "What tyres should I use for Atlas Mountain Race?",
+            "expected_event": "Atlas Mountain Race",
+            "expected_event_match_type": "exact",
+            "expected_intent": "component_tyres",
+            "expected_component": "tyres",
+            "expected_policy_mode": "strict_grounded",
+            "expected_retrieval_mode": "exact_then_similar",
+            "expected_guardedness": "low",
+            "must_mention": ["Atlas Mountain Race", "tyre"],
+            "must_not_do": ["invent unsupported rider evidence"],
+        }
+    )
+
+    assert row["status"] == "failure"
+    assert row["failure_kind"] == "output_schema_failure"
+    assert row["scenario_id"] == "sample"
+    assert row["expected_event"] == "Atlas Mountain Race"
