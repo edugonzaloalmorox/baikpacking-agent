@@ -1,0 +1,408 @@
+# Manual eval contract:
+# - expected_event_match_type: exact, alias, similar, unknown
+# - expected_retrieval_mode: exact_only, exact_then_similar, similar_only, generic_fallback
+# - expected_guardedness: low, medium, high
+# - must_mention and must_not_do stay as explicit string lists for easy manual editing.
+
+scenarios:
+  # =====================
+  # 1. Exact known event
+  # =====================
+
+  - id: exact_atlas_full_setup
+    question: "Suggest a bikepacking setup for Atlas Mountain Race"
+    group: exact_known_event
+    why: "Tests exact event grounding and full setup generation"
+    expected_event: "Atlas Mountain Race"
+    expected_event_match_type: "exact"
+    expected_intent: "full_setup"
+    expected_component: "full_setup"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Atlas Mountain Race"
+      - "setup"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "switch focus to bags"
+    notes: ""
+
+  - id: exact_granguanche_tyres
+    question: "What tyres should I use for GranGuanche Audax Gravel?"
+    group: exact_known_event
+    why: "Tests component-specific query with exact event"
+    expected_event: "GranGuanche Audax Gravel"
+    expected_event_match_type: "exact"
+    expected_intent: "component_tyres"
+    expected_component: "tyres"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "GranGuanche Audax Gravel"
+      - "tyre"
+    must_not_do:
+      - "talk about bags"
+      - "invent drivetrain details"
+    notes: ""
+
+  - id: exact_transiberica_bags
+    question: "What bags make sense for Transiberica?"
+    group: exact_known_event
+    why: "Tests bags recommendation with exact event"
+    expected_event: "Transiberica"
+    expected_event_match_type: "exact"
+    expected_intent: "component_bags"
+    expected_component: "bags"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Transiberica"
+      - "bag"
+    must_not_do:
+      - "drivetrain"
+      - "sleep system"
+    notes: ""
+
+  # =====================
+  # 2. Alias / variation
+  # =====================
+
+  - id: alias_amr
+    question: "What bike for AMR?"
+    group: alias_variation
+    why: "Tests short alias resolution"
+    expected_event: "Atlas Mountain Race"
+    expected_event_match_type: "alias"
+    expected_intent: "component_bike_type"
+    expected_component: "bike_type"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Atlas Mountain Race"
+      - "bike"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "switch focus to bags"
+    notes: ""
+
+  - id: alias_granguanche_variation
+    question: "Setup for the Granguanche gravel audax"
+    group: alias_variation
+    why: "Tests fuzzy naming and spelling"
+    expected_event: "GranGuanche Audax Gravel"
+    expected_event_match_type: "alias"
+    expected_intent: "full_setup"
+    expected_component: "full_setup"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "GranGuanche Audax Gravel"
+      - "gravel"
+    must_not_do:
+      - "treat it as a different race"
+      - "invent unsupported rider evidence"
+    notes: ""
+
+  - id: alias_atlas_morocco
+    question: "What should I ride for the Atlas race in Morocco?"
+    group: alias_variation
+    why: "Tests semantic alias rather than exact name"
+    expected_event: "Atlas Mountain Race"
+    expected_event_match_type: "alias"
+    expected_intent: "component_bike_type"
+    expected_component: "bike_type"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Atlas Mountain Race"
+      - "Atlas"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "switch focus to bags"
+    notes: ""
+
+  # =====================
+  # 3. Unknown event
+  # =====================
+
+  - id: unknown_northcape_tarifa
+    question: "Suggest a setup for the North Cape Tarifa race"
+    group: unknown_event
+    why: "Tests unknown event fallback to similar archetype"
+    expected_event: "unknown"
+    expected_event_match_type: "unknown"
+    expected_intent: "full_setup"
+    expected_component: "full_setup"
+    expected_policy_mode: "pattern_based"
+    expected_retrieval_mode: "similar_only"
+    expected_guardedness: "medium"
+    must_mention:
+      - "bikepacking"
+      - "setup"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "claim an exact event match"
+    notes: ""
+
+  - id: unknown_iberian_divide
+    question: "What bike should I bring for the Iberian Divide Ultra?"
+    group: unknown_event
+    why: "Tests plausible but unknown event"
+    expected_event: "unknown"
+    expected_event_match_type: "unknown"
+    expected_intent: "component_bike_type"
+    expected_component: "bike_type"
+    expected_policy_mode: "pattern_based"
+    expected_retrieval_mode: "similar_only"
+    expected_guardedness: "medium"
+    must_mention:
+      - "bike"
+      - "setup"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "claim an exact event match"
+    notes: ""
+
+  - id: unknown_balkans_race
+    question: "How would you prepare a setup for a Balkans coast-to-coast self-supported race?"
+    group: unknown_event
+    why: "Tests generic reasoning over unknown event"
+    expected_event: "unknown"
+    expected_event_match_type: "unknown"
+    expected_intent: "full_setup"
+    expected_component: "full_setup"
+    expected_policy_mode: "generic_fallback"
+    expected_retrieval_mode: "generic_fallback"
+    expected_guardedness: "high"
+    must_mention:
+      - "self-supported"
+      - "setup"
+    must_not_do:
+      - "invent specific riders"
+      - "name a fake event match"
+    notes: ""
+
+  # =====================
+  # 4. Component-specific
+  # =====================
+
+  - id: component_silkroad_drivetrain
+    question: "What drivetrain for Silk Road Mountain Race?"
+    group: component_specific
+    why: "Tests drivetrain recommendation"
+    expected_event: "Silk Road Mountain Race"
+    expected_event_match_type: "exact"
+    expected_intent: "component_drivetrain"
+    expected_component: "drivetrain"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Silk Road Mountain Race"
+      - "drivetrain"
+    must_not_do:
+      - "talk about bags"
+      - "invent tyre details"
+    notes: ""
+
+  - id: component_badlands_sleep
+    question: "What sleep system for Badlands?"
+    group: component_specific
+    why: "Tests sleep system extraction"
+    expected_event: "Badlands"
+    expected_event_match_type: "exact"
+    expected_intent: "component_sleep_system"
+    expected_component: "sleep_system"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Badlands"
+      - "sleep system"
+    must_not_do:
+      - "drivetrain"
+      - "bag setup"
+    notes: ""
+
+  - id: component_atlas_wheels
+    question: "What wheels for Atlas Mountain Race?"
+    group: component_specific
+    why: "Tests wheel recommendation"
+    expected_event: "Atlas Mountain Race"
+    expected_event_match_type: "exact"
+    expected_intent: "component_wheels"
+    expected_component: "wheels"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Atlas Mountain Race"
+      - "wheels"
+    must_not_do:
+      - "sleep system"
+      - "bag setup"
+    notes: ""
+
+  # =====================
+  # 5. Broad / vague
+  # =====================
+
+  - id: vague_badlands_setup
+    question: "I’m doing Badlands. What kind of setup makes sense?"
+    group: vague_query
+    why: "Tests vague phrasing with implicit full setup"
+    expected_event: "Badlands"
+    expected_event_match_type: "exact"
+    expected_intent: "full_setup"
+    expected_component: "full_setup"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Badlands"
+      - "setup"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "switch focus to bags"
+    notes: ""
+
+  - id: vague_transcontinental
+    question: "Help me figure out a setup for Transcontinental"
+    group: vague_query
+    why: "Tests underspecified user request"
+    expected_event: "Transcontinental Race"
+    expected_event_match_type: "alias"
+    expected_intent: "full_setup"
+    expected_component: "full_setup"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Transcontinental Race"
+      - "setup"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "switch focus to bags"
+    notes: ""
+
+  - id: vague_europe_race
+    question: "I want to race across Europe self-supported. What bikepacking setup would you recommend?"
+    group: vague_query
+    why: "Tests no event, only archetype"
+    expected_event: "unknown"
+    expected_event_match_type: "unknown"
+    expected_intent: "full_setup"
+    expected_component: "full_setup"
+    expected_policy_mode: "pattern_based"
+    expected_retrieval_mode: "similar_only"
+    expected_guardedness: "medium"
+    must_mention:
+      - "setup"
+      - "bikepacking"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "claim an exact event match"
+    notes: ""
+
+  # =====================
+  # 6. Edge / failure
+  # =====================
+
+  - id: edge_entry_fee
+    question: "What’s the entry fee for Tour Divide?"
+    group: edge_case
+    why: "Out-of-scope question"
+    expected_event: "Tour Divide"
+    expected_event_match_type: "exact"
+    expected_intent: "unsupported"
+    expected_component: "none"
+    expected_policy_mode: "generic_fallback"
+    expected_retrieval_mode: "generic_fallback"
+    expected_guardedness: "high"
+    must_mention:
+      - "Tour Divide"
+      - "entry fee"
+    must_not_do:
+      - "invent an entry fee"
+      - "claim insider knowledge"
+    notes: ""
+
+  - id: edge_compare_races
+    question: "Compare Transpyrenees and Leadville bikes"
+    group: edge_case
+    why: "Comparison not directly supported"
+    expected_event: "unknown"
+    expected_event_match_type: "unknown"
+    expected_intent: "comparison"
+    expected_component: "none"
+    expected_policy_mode: "generic_fallback"
+    expected_retrieval_mode: "generic_fallback"
+    expected_guardedness: "high"
+    must_mention:
+      - "Transpyrenees"
+      - "Leadville"
+    must_not_do:
+      - "pretend to compare rider evidence"
+      - "invent a definitive winner"
+    notes: ""
+
+  - id: edge_training_question
+    question: "How do I train for VO2 max before GranGuanche?"
+    group: edge_case
+    why: "Out-of-scope training question"
+    expected_event: "GranGuanche"
+    expected_event_match_type: "alias"
+    expected_intent: "unsupported"
+    expected_component: "none"
+    expected_policy_mode: "generic_fallback"
+    expected_retrieval_mode: "generic_fallback"
+    expected_guardedness: "high"
+    must_mention:
+      - "GranGuanche"
+      - "training"
+    must_not_do:
+      - "invent training advice"
+      - "answer as if this were a gear question"
+    notes: ""
+
+  - id: edge_unrelated_chess
+    question: "What is the Queen’s Gambit in chess?"
+    group: edge_case
+    why: "Completely unrelated query"
+    expected_event: "unknown"
+    expected_event_match_type: "unknown"
+    expected_intent: "irrelevant"
+    expected_component: "none"
+    expected_policy_mode: "generic_fallback"
+    expected_retrieval_mode: "generic_fallback"
+    expected_guardedness: "high"
+    must_mention:
+      - "chess"
+    must_not_do:
+      - "answer with bikepacking content"
+      - "invent an event match"
+    notes: ""
+
+  - id: edge_ml_question
+    question: "How do I fix class imbalance in my dataset?"
+    group: edge_case
+    why: "Domain-adjacent but not relevant"
+    expected_event: "unknown"
+    expected_event_match_type: "unknown"
+    expected_intent: "irrelevant"
+    expected_component: "none"
+    expected_policy_mode: "generic_fallback"
+    expected_retrieval_mode: "generic_fallback"
+    expected_guardedness: "high"
+    must_mention:
+      - "dataset"
+    must_not_do:
+      - "answer with bikepacking content"
+      - "invent an event match"
+    notes: ""
