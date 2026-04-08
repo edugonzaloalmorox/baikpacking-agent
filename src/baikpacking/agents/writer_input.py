@@ -33,6 +33,7 @@ class WriterInput(BaseModel):
     descriptor_query: str
     query_component: str = "full_setup"
     component_hit_count: int = 0
+    grounding_mode: str = "exact_event"
     similar_riders: List[CompactRider]
 
 

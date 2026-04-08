@@ -8,6 +8,13 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from baikpacking.agents.review_feedback import (
+    DEFAULT_REVIEWS_PATH,
+    build_run_key,
+    load_reviews,
+    review_from_run,
+    save_review,
+)
 
 DEFAULT_RUNS_PATH = Path(__file__).resolve().parents[3] / "data/eval/scenario_runs.jsonl"
 
@@ -169,7 +176,10 @@ def main() -> None:
     """Render the local eval dashboard."""
     st.set_page_config(page_title="bAIpacking Eval Dashboard", layout="wide")
     st.title("bAIpacking Eval Dashboard")
-    st.caption("Local-only viewer for `data/eval/scenario_runs.jsonl`.")
+    st.caption(
+        "Local-only viewer for `data/eval/scenario_runs.jsonl` with optional reviewer notes in "
+        f"`{DEFAULT_REVIEWS_PATH}`."
+    )
 
     runs_path = Path(st.sidebar.text_input("Scenario runs JSONL", value=str(DEFAULT_RUNS_PATH)))
     refresh = st.sidebar.button("Reload data")
@@ -181,6 +191,7 @@ def main() -> None:
 
     base_columns = [
         "scenario_id",
+        "timestamp",
         "status",
         "failure_kind",
         "expected_event",
@@ -201,6 +212,9 @@ def main() -> None:
         "expected_event_match_type",
     ]
     df = _ensure_columns(df, base_columns)
+    df["run_key"] = df.apply(lambda row: build_run_key(row.to_dict()), axis=1)
+    reviews = load_reviews(DEFAULT_REVIEWS_PATH)
+    reviews_by_key = {review.run_key: review for review in reviews}
 
     with st.sidebar:
         st.subheader("Filters")
@@ -311,12 +325,21 @@ def main() -> None:
     st.subheader("Drill-down table")
     table_columns = [
         "scenario_id",
+        "timestamp",
         "status",
         "failure_kind",
         "expected_event",
         "resolved_event_name",
         "expected_component",
         "policy_mode",
+        "expected_policy_mode",
+        "event_match_type",
+        "expected_event_match_type",
+        "retrieval_source",
+        "retrieval_mode",
+        "expected_retrieval_mode",
+        "exact_event_hit_count",
+        "knowledge_base_exact_match",
         "content_assertion_issue_count",
         "event_alignment_issue_count",
     ]
@@ -329,6 +352,8 @@ def main() -> None:
         format_func=lambda idx: f"{filtered.loc[idx, 'scenario_id']} | {filtered.loc[idx, 'status']} | {filtered.loc[idx, 'failure_kind']}",
     )
     row = filtered.loc[selected_index]
+    current_review = reviews_by_key.get(str(row.get("run_key") or ""))
+    review_seed = review_from_run(row.to_dict(), existing=current_review)
 
     st.subheader("Row details")
     detail_cols = st.columns(2)
@@ -345,12 +370,87 @@ def main() -> None:
     with detail_cols[1]:
         st.markdown("**Recommended setup**")
         st.code(_safe_text(row.get("recommended_setup")) or "(none)")
+
+        st.subheader("Human review")
+        if current_review is not None:
+            st.caption(
+                f"Existing review: {current_review.review_status} / {current_review.human_label} "
+                f"at {current_review.review_timestamp}"
+            )
+        else:
+            st.caption("No saved review for this run yet.")
+
+        with st.form(key=f"review_form_{row.get('run_key')}"):
+            review_status = st.selectbox(
+                "Review status",
+                options=["pending", "approved", "rejected", "needs_followup"],
+                index=["pending", "approved", "rejected", "needs_followup"].index(review_seed.review_status),
+            )
+            human_label = st.selectbox(
+                "Human label",
+                options=["good", "bad", "partially_good"],
+                index=["good", "bad", "partially_good"].index(review_seed.human_label),
+            )
+            corrected_event = st.text_input(
+                "Corrected event",
+                value=review_seed.corrected_event or "",
+                placeholder="Optional",
+            )
+            corrected_component = st.text_input(
+                "Corrected component",
+                value=review_seed.corrected_component or "",
+                placeholder="Optional",
+            )
+            corrected_policy_mode = st.text_input(
+                "Corrected policy mode",
+                value=review_seed.corrected_policy_mode or "",
+                placeholder="Optional",
+            )
+            review_notes = st.text_area(
+                "Review notes",
+                value=review_seed.review_notes or "",
+                height=120,
+                placeholder="Short reviewer notes, corrections, or follow-up items.",
+            )
+            saved = st.form_submit_button("Save review")
+            if saved:
+                review = review_from_run(row.to_dict(), existing=current_review)
+                review.review_status = review_status
+                review.human_label = human_label
+                review.corrected_event = corrected_event.strip() or None
+                review.corrected_component = corrected_component.strip() or None
+                review.corrected_policy_mode = corrected_policy_mode.strip() or None
+                review.review_notes = review_notes.strip() or None
+                save_review(review, DEFAULT_REVIEWS_PATH)
+                st.success(f"Saved review for {review.run_key}")
+                st.rerun()
+
         st.markdown("**Raw trace snippet**")
         raw_trace = _list_from_cell(row.get("raw_trace_steps"))
         if raw_trace:
             st.code(json.dumps(raw_trace[:3], ensure_ascii=False, indent=2))
         else:
             st.code("(none)")
+
+    st.subheader("Reviewed cases")
+    if reviews:
+        reviewed_df = pd.DataFrame([review.model_dump() for review in reviews])
+        review_columns = [
+            "run_key",
+            "scenario_id",
+            "review_status",
+            "human_label",
+            "expected_event",
+            "expected_component",
+            "corrected_event",
+            "corrected_component",
+            "corrected_policy_mode",
+            "review_timestamp",
+        ]
+        review_columns = [column for column in review_columns if column in reviewed_df.columns]
+        st.dataframe(reviewed_df[review_columns], use_container_width=True, hide_index=True)
+    else:
+        st.info(f"No saved reviews yet. Reviews will be stored in `{DEFAULT_REVIEWS_PATH}`.")
 
     if refresh:
         st.rerun()

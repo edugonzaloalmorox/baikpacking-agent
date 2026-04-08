@@ -413,6 +413,24 @@ def _find_similar_articles(conn, event_hint: str) -> List[Dict[str, Any]]:
 
     return out
 
+
+def _synthesize_exact_event_chunk_rank(
+    rider_ids: List[int],
+    top_k_riders: int,
+) -> Dict[int, Dict[str, Any]]:
+    """Create a minimal exact-event rank when scoped riders exist but chunk scoring is empty."""
+    return {
+        int(rider_id): {
+            "best_distance": 0.0,
+            "best_score": 1.0,
+            "weighted_best_score": 1.0,
+            "weighted_best_distance": 0.0,
+            "source_scope": "exact_event",
+            "chunks": [],
+        }
+        for rider_id in rider_ids[: int(top_k_riders)]
+    }
+
 def _classify_event_titles(conn, event_hint: str) -> Dict[str, List[str]]:
     articles = _fetch_event_articles(conn)
 
@@ -1612,6 +1630,14 @@ def run_search_similar_riders(
                         rider_ids=exact_rider_ids,
                         max_chunks_per_rider=int(max_chunks_per_rider),
                     )
+                    if exact_rider_ids and not exact_chunk_rank:
+                        # Keep exact-event grounding alive even when the query is too thin
+                        # to score event-specific chunks. This is a deterministic exact-event
+                        # fallback, not a similar-event fallback.
+                        exact_chunk_rank = _synthesize_exact_event_chunk_rank(
+                            exact_rider_ids,
+                            top_k_riders=int(top_k_riders),
+                        )
 
                 if similar_event_titles and (not exact_chunk_rank or exact_rider_count < _MIN_EXACT_EVENT_RIDERS):
                     similar_chunk_rank = _fetch_top_riders_by_chunks_for_event_titles(

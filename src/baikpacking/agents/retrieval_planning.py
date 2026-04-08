@@ -10,11 +10,10 @@ def build_retrieval_plan(
     intent: QueryIntent,
     user_query: str,
 ) -> RetrievalPlan:
-    event_name_for_retrieval = (
-        event_resolution.display_name
-        if event_resolution.is_trusted_exact
-        else (event_context_summary.event_family or event_resolution.display_name)
-    )
+    if event_resolution.canonical_name and event_resolution.match_type in {"exact", "alias"}:
+        event_name_for_retrieval = event_resolution.canonical_name
+    else:
+        event_name_for_retrieval = event_context_summary.event_family or event_resolution.display_name
 
     descriptor = _build_descriptor_query(
         event_name=event_resolution.display_name,
