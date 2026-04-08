@@ -11,22 +11,22 @@ scenarios:
 
   - id: exact_atlas_full_setup
     question: "Suggest a bikepacking setup for Atlas Mountain Race"
-    group: exact_known_event
-    why: "Tests exact event grounding and full setup generation"
+    group: kb_gap_known_event
+    why: "Tests known event resolution with similar-event grounding because Atlas Mountain Race is not in the knowledge base"
     expected_event: "Atlas Mountain Race"
     expected_event_match_type: "exact"
     expected_intent: "full_setup"
     expected_component: "full_setup"
-    expected_policy_mode: "strict_grounded"
-    expected_retrieval_mode: "exact_then_similar"
-    expected_guardedness: "low"
+    expected_policy_mode: "pattern_based"
+    expected_retrieval_mode: "similar_only"
+    expected_guardedness: "medium"
     must_mention:
       - "Atlas Mountain Race"
       - "setup"
     must_not_do:
       - "invent unsupported rider evidence"
-      - "switch focus to bags"
-    notes: ""
+      - "claim exact rider grounding for Atlas Mountain Race"
+    notes: "Atlas Mountain Race should resolve correctly by name but be grounded via similar events in the knowledge base."
 
   - id: exact_granguanche_tyres
     question: "What tyres should I use for GranGuanche Audax Gravel?"
@@ -73,21 +73,21 @@ scenarios:
   - id: alias_amr
     question: "What bike for AMR?"
     group: alias_variation
-    why: "Tests short alias resolution"
+    why: "Tests short alias resolution for Atlas Mountain Race with similar-event grounding"
     expected_event: "Atlas Mountain Race"
     expected_event_match_type: "alias"
     expected_intent: "component_bike_type"
     expected_component: "bike_type"
-    expected_policy_mode: "strict_grounded"
-    expected_retrieval_mode: "exact_then_similar"
-    expected_guardedness: "low"
+    expected_policy_mode: "pattern_based"
+    expected_retrieval_mode: "similar_only"
+    expected_guardedness: "medium"
     must_mention:
       - "Atlas Mountain Race"
       - "bike"
     must_not_do:
       - "invent unsupported rider evidence"
-      - "switch focus to bags"
-    notes: ""
+      - "claim exact rider grounding for Atlas Mountain Race"
+    notes: "AMR should resolve to Atlas Mountain Race, but retrieval should rely on similar events present in the knowledge base."
 
   - id: alias_granguanche_variation
     question: "Setup for the Granguanche gravel audax"
@@ -111,21 +111,21 @@ scenarios:
   - id: alias_atlas_morocco
     question: "What should I ride for the Atlas race in Morocco?"
     group: alias_variation
-    why: "Tests semantic alias rather than exact name"
+    why: "Tests semantic alias resolution for Atlas Mountain Race with similar-event grounding"
     expected_event: "Atlas Mountain Race"
     expected_event_match_type: "alias"
     expected_intent: "component_bike_type"
     expected_component: "bike_type"
-    expected_policy_mode: "strict_grounded"
-    expected_retrieval_mode: "exact_then_similar"
-    expected_guardedness: "low"
+    expected_policy_mode: "pattern_based"
+    expected_retrieval_mode: "similar_only"
+    expected_guardedness: "medium"
     must_mention:
       - "Atlas Mountain Race"
       - "Atlas"
     must_not_do:
       - "invent unsupported rider evidence"
-      - "switch focus to bags"
-    notes: ""
+      - "claim exact rider grounding for Atlas Mountain Race"
+    notes: "Atlas Mountain Race is not in the knowledge base, so recommendations should be based on similar events."
 
   # =====================
   # 3. Unknown event
@@ -200,9 +200,9 @@ scenarios:
     expected_event_match_type: "exact"
     expected_intent: "component_drivetrain"
     expected_component: "drivetrain"
-    expected_policy_mode: "strict_grounded"
-    expected_retrieval_mode: "exact_then_similar"
-    expected_guardedness: "low"
+    expected_policy_mode: "pattern_based"
+    expected_retrieval_mode: "similar_only"
+    expected_guardedness: "medium"
     must_mention:
       - "Silk Road Mountain Race"
       - "drivetrain"
@@ -233,21 +233,21 @@ scenarios:
   - id: component_atlas_wheels
     question: "What wheels for Atlas Mountain Race?"
     group: component_specific
-    why: "Tests wheel recommendation"
+    why: "Tests wheel recommendation for Atlas Mountain Race using similar-event grounding"
     expected_event: "Atlas Mountain Race"
     expected_event_match_type: "exact"
     expected_intent: "component_wheels"
     expected_component: "wheels"
-    expected_policy_mode: "strict_grounded"
-    expected_retrieval_mode: "exact_then_similar"
-    expected_guardedness: "low"
+    expected_policy_mode: "pattern_based"
+    expected_retrieval_mode: "similar_only"
+    expected_guardedness: "medium"
     must_mention:
       - "Atlas Mountain Race"
       - "wheels"
     must_not_do:
       - "sleep system"
-      - "bag setup"
-    notes: ""
+      - "claim exact rider grounding for Atlas Mountain Race"
+    notes: "Atlas Mountain Race is not in the knowledge base; wheel recommendations should be inferred from similar events."
 
   # =====================
   # 5. Broad / vague
@@ -405,4 +405,403 @@ scenarios:
     must_not_do:
       - "answer with bikepacking content"
       - "invent an event match"
+    notes: ""
+   
+  - id: exact_trans_balkan_bike
+    question: "What bike type makes sense for Trans Balkan Race 2025?"
+    group: exact_known_event
+    why: "Tests exact event grounding for bike type on a known event in the KB"
+    expected_event: "Trans Balkan Race 2025"
+    expected_event_match_type: "exact"
+    expected_intent: "component_bike_type"
+    expected_component: "bike_type"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Trans Balkan Race 2025"
+      - "bike"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "switch focus to bags"
+    notes: ""
+
+  - id: exact_highland_sleep
+    question: "What sleep system would you use for Highland Trail 550 2025?"
+    group: exact_known_event
+    why: "Tests exact event grounding for sleep system"
+    expected_event: "Highland Trail 550 2025"
+    expected_event_match_type: "exact"
+    expected_intent: "component_sleep_system"
+    expected_component: "sleep_system"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Highland Trail 550 2025"
+      - "sleep system"
+    must_not_do:
+      - "talk about drivetrain"
+      - "invent unsupported rider evidence"
+    notes: ""
+
+  - id: exact_three_peaks_tyres
+    question: "What tyres should I use for Three Peaks Bike Race 2025?"
+    group: exact_known_event
+    why: "Tests tyre recommendation for an exact known event"
+    expected_event: "Three Peaks Bike Race 2025"
+    expected_event_match_type: "exact"
+    expected_intent: "component_tyres"
+    expected_component: "tyres"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Three Peaks Bike Race 2025"
+      - "tyre"
+    must_not_do:
+      - "talk about bags"
+      - "invent unsupported rider evidence"
+    notes: ""
+
+  - id: exact_basajaun_full_setup
+    question: "Suggest a setup for Basajaun 2025"
+    group: exact_known_event
+    why: "Tests full setup generation for an exact known event"
+    expected_event: "Basajaun 2025"
+    expected_event_match_type: "exact"
+    expected_intent: "full_setup"
+    expected_component: "full_setup"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Basajaun 2025"
+      - "setup"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "switch focus to bags"
+    notes: ""
+
+  - id: exact_race_around_rwanda_bags
+    question: "What bags make sense for Race Around Rwanda 2025?"
+    group: exact_known_event
+    why: "Tests bags recommendation for a known event in the KB"
+    expected_event: "Race Around Rwanda 2025"
+    expected_event_match_type: "exact"
+    expected_intent: "component_bags"
+    expected_component: "bags"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Race Around Rwanda 2025"
+      - "bag"
+    must_not_do:
+      - "talk about sleep system"
+      - "invent unsupported rider evidence"
+    notes: ""
+
+  - id: exact_tour_divide_dotwatcher_bike
+    question: "What bike setup is shown in Bike of the Tour Divide: DotWatcher Team Edition?"
+    group: exact_known_event
+    why: "Tests handling of a Tour Divide-related exact title present in the KB"
+    expected_event: "Bike of the Tour Divide: DotWatcher Team Edition"
+    expected_event_match_type: "exact"
+    expected_intent: "component_bike_type"
+    expected_component: "bike_type"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_only"
+    expected_guardedness: "low"
+    must_mention:
+      - "Tour Divide"
+      - "bike"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "treat it as an unknown event"
+    notes: ""
+
+  - id: alias_gbduro25_setup
+    question: "What kind of setup for GBDURO25?"
+    group: alias_variation
+    why: "Tests alias-style exact title for GBDURO25"
+    expected_event: "GBDURO25"
+    expected_event_match_type: "exact"
+    expected_intent: "full_setup"
+    expected_component: "full_setup"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "GBDURO25"
+      - "setup"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "switch focus to bags"
+    notes: ""
+
+  - id: alias_transcontinental_no11
+    question: "What bike would you take to TCR No11?"
+    group: alias_variation
+    why: "Tests alias resolution for Transcontinental Race No11"
+    expected_event: "Transcontinental Race No11"
+    expected_event_match_type: "alias"
+    expected_intent: "component_bike_type"
+    expected_component: "bike_type"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Transcontinental Race No11"
+      - "bike"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "treat it as a different race"
+    notes: ""
+
+  - id: alias_ratn_gx
+    question: "What setup makes sense for RATN GX 2025?"
+    group: alias_variation
+    why: "Tests alias resolution for Race Around The Netherlands GX 2025"
+    expected_event: "Race Around The Netherlands GX 2025"
+    expected_event_match_type: "alias"
+    expected_intent: "full_setup"
+    expected_component: "full_setup"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Race Around The Netherlands GX 2025"
+      - "setup"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "switch focus to bags"
+    notes: ""
+
+  - id: alias_transpyrenees_transiberica
+    question: "What tyres would you run for Transpyrenees by Transiberica 2025?"
+    group: alias_variation
+    why: "Tests exact-ish long event title with component-specific query"
+    expected_event: "Transpyrenees by Transibérica 2025"
+    expected_event_match_type: "alias"
+    expected_intent: "component_tyres"
+    expected_component: "tyres"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Transpyrenees"
+      - "tyre"
+    must_not_do:
+      - "talk about bags"
+      - "invent unsupported rider evidence"
+    notes: ""
+
+  - id: alias_log_drivers_waltz
+    question: "What bikepacking setup for Log Driver's Waltz 2023?"
+    group: alias_variation
+    why: "Tests punctuation/apostrophe variation on a known event"
+    expected_event: "Log Driver's Waltz 2023"
+    expected_event_match_type: "alias"
+    expected_intent: "full_setup"
+    expected_component: "full_setup"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Log Driver's Waltz 2023"
+      - "setup"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "claim an unknown event"
+    notes: ""
+
+  - id: component_bohemian_bags
+    question: "What bags for Bohemian Border Bash Race 2025?"
+    group: component_specific
+    why: "Tests bag recommendation for a known event in the KB"
+    expected_event: "Bohemian Border Bash Race 2025"
+    expected_event_match_type: "exact"
+    expected_intent: "component_bags"
+    expected_component: "bags"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Bohemian Border Bash Race 2025"
+      - "bag"
+    must_not_do:
+      - "drivetrain"
+      - "sleep system"
+    notes: ""
+
+  - id: component_ardennes_monster_wheels
+    question: "What wheels for Ardennes Monster 2025?"
+    group: component_specific
+    why: "Tests wheel recommendation on a known event"
+    expected_event: "Ardennes Monster 2025"
+    expected_event_match_type: "exact"
+    expected_intent: "component_wheels"
+    expected_component: "wheels"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Ardennes Monster 2025"
+      - "wheels"
+    must_not_do:
+      - "sleep system"
+      - "bag setup"
+    notes: ""
+
+  - id: component_pan_celtic_sleep
+    question: "What sleep system would you recommend for Pan Celtic Race 2024?"
+    group: component_specific
+    why: "Tests sleep-system grounding on a known event"
+    expected_event: "Pan Celtic Race 2024"
+    expected_event_match_type: "exact"
+    expected_intent: "component_sleep_system"
+    expected_component: "sleep_system"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Pan Celtic Race 2024"
+      - "sleep system"
+    must_not_do:
+      - "drivetrain"
+      - "bag setup"
+    notes: ""
+
+  - id: component_bright_midnight_lights
+    question: "What lights make sense for the Bright Midnight 2025?"
+    group: component_specific
+    why: "Tests a component outside the core setup fields but relevant to night racing"
+    expected_event: "the Bright Midnight 2025"
+    expected_event_match_type: "alias"
+    expected_intent: "component_lights"
+    expected_component: "lights"
+    expected_policy_mode: "pattern_based"
+    expected_retrieval_mode: "similar_only"
+    expected_guardedness: "medium"
+    must_mention:
+      - "Bright Midnight"
+      - "light"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "switch focus to bags"
+    notes: "Use if the system supports lights as a component; otherwise move to unsupported or generic fallback."
+
+  - id: vague_trans_balkan_setup
+    question: "I’m doing Trans Balkan Race. What setup makes sense?"
+    group: vague_query
+    why: "Tests vague full-setup query on a known event"
+    expected_event: "Trans Balkan Race 2025"
+    expected_event_match_type: "alias"
+    expected_intent: "full_setup"
+    expected_component: "full_setup"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Trans Balkan Race 2025"
+      - "setup"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "switch focus to bags"
+    notes: ""
+
+  - id: vague_unknown_race_setup
+    question: "I’m doing The Unknown Race. What bikepacking setup would you recommend?"
+    group: vague_query
+    why: "Tests a known event with a name that could confuse the resolver"
+    expected_event: "The Unknown Race 2025"
+    expected_event_match_type: "exact"
+    expected_intent: "full_setup"
+    expected_component: "full_setup"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "The Unknown Race 2025"
+      - "setup"
+    must_not_do:
+      - "treat it as an unknown event"
+      - "invent unsupported rider evidence"
+    notes: ""
+
+  - id: vague_dales_divide
+    question: "Help me figure out a setup for Dales Divide 2025"
+    group: vague_query
+    why: "Tests underspecified setup request on a known event"
+    expected_event: "Dales Divide 2025"
+    expected_event_match_type: "exact"
+    expected_intent: "full_setup"
+    expected_component: "full_setup"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Dales Divide 2025"
+      - "setup"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "switch focus to bags"
+    notes: ""
+
+  - id: exact_final_frontier_patagonia_bike
+    question: "What bike would you take to Final Frontier Patagonia 2026?"
+    group: exact_known_event
+    why: "Tests exact event grounding on a 2026 event in the KB"
+    expected_event: "Final Frontier Patagonia 2026"
+    expected_event_match_type: "exact"
+    expected_intent: "component_bike_type"
+    expected_component: "bike_type"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Final Frontier Patagonia 2026"
+      - "bike"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "switch focus to bags"
+    notes: ""
+
+  - id: exact_andean_raid_setup
+    question: "Suggest a setup for Andean Raid 2025"
+    group: exact_known_event
+    why: "Tests full setup on a known Andean event in the KB"
+    expected_event: "Andean Raid 2025"
+    expected_event_match_type: "exact"
+    expected_intent: "full_setup"
+    expected_component: "full_setup"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Andean Raid 2025"
+      - "setup"
+    must_not_do:
+      - "invent unsupported rider evidence"
+      - "switch focus to bags"
+    notes: ""
+
+  - id: exact_across_andes_patagonia_verde_tyres
+    question: "What tyres should I run for Across Andes: Patagonia Verde 2024?"
+    group: exact_known_event
+    why: "Tests tyre recommendation on another Patagonia/Andes event in the KB"
+    expected_event: "Across Andes: Patagonia Verde 2024"
+    expected_event_match_type: "exact"
+    expected_intent: "component_tyres"
+    expected_component: "tyres"
+    expected_policy_mode: "strict_grounded"
+    expected_retrieval_mode: "exact_then_similar"
+    expected_guardedness: "low"
+    must_mention:
+      - "Across Andes: Patagonia Verde 2024"
+      - "tyre"
+    must_not_do:
+      - "talk about bags"
+      - "invent unsupported rider evidence"
     notes: ""
