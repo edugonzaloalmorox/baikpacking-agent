@@ -32,6 +32,36 @@ def test_build_retrieval_plan_exact_event_full_setup():
     assert plan.fallback_query == plan.descriptor_query_with_intent
 
 
+def test_build_retrieval_plan_alias_keeps_canonical_event_name():
+    event_resolution = EventResolutionResult(
+        display_name="Atlas Mountain Race",
+        canonical_name="Atlas Mountain Race",
+        match_type="alias",
+        confidence=0.93,
+        is_trusted_exact=False,
+    )
+    event_context_summary = EventContextSummary(
+        requested_event_name="Atlas Mountain Race",
+        web_context_text="Remote mountain ultra",
+        event_family="mountain_gravel_ultra",
+        archetype="mountain_offroad_ultra",
+        surface_family="mixed_offroad",
+    )
+    intent = QueryIntent(component="bike_type", confidence=0.5, component_terms=["bike"])
+
+    plan = build_retrieval_plan(
+        event_resolution=event_resolution,
+        event_context_summary=event_context_summary,
+        intent=intent,
+        user_query="What bike for AMR?",
+    )
+
+    assert plan.use_exact_event is False
+    assert plan.event_name_for_retrieval == "Atlas Mountain Race"
+    assert plan.primary_query != plan.descriptor_query_with_intent
+    assert "Focus: bike type" in plan.primary_query
+
+
 def test_build_retrieval_plan_low_confidence_event_represents_inferred_context():
     event_resolution = EventResolutionResult(
         display_name="North Cape Tarifa",
