@@ -90,8 +90,24 @@ class SetupCore(BaseModel):
         return all(v is None or (isinstance(v, str) and not v.strip()) for v in vals)
 
 
+class WriterRecommendationDraft(BaseModel):
+    """Minimum writer-owned draft recommendation.
+
+    The LLM only owns recommendation content here: event, summary, reasoning,
+    and the compact recommended_setup. Similar riders and other grounding
+    metadata are assembled deterministically by code after generation.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    event: Optional[str] = None
+    summary: str
+    reasoning: str
+    recommended_setup: SetupCore = Field(default_factory=SetupCore)
+
+
 class SetupRecommendation(BaseModel):
-    """Final grounded agent output."""
+    """Final grounded agent output assembled by code."""
 
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
