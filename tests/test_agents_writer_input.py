@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from baikpacking.agents.writer_input import _compact_riders, _event_context_to_text
+from baikpacking.agents.writer_input import WriterInput, _compact_riders, _event_context_to_text
 
 
 def test_compact_riders_limits_chunks_and_key_items_and_infers_year():
@@ -50,3 +50,16 @@ def test_event_context_to_text_joins_non_empty_fields():
     assert "Remote ultra" in text
     assert "Mostly paved" in text
     assert "carry lights self-supported" in text
+
+
+def test_writer_input_includes_grounding_mode():
+    payload = WriterInput(
+        user_query="What tyres should I use?",
+        event_name="Atlas Mountain Race",
+        event_context="Remote mountain ultra",
+        descriptor_query="atlas mountain race tyres",
+        grounding_mode="similar_event",
+        similar_riders=[],
+    )
+
+    assert payload.grounding_mode == "similar_event"
