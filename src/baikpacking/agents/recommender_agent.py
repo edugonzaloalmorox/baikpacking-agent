@@ -427,6 +427,14 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
 
         record_trace_call(
             deps=deps,
+            tool_name="event_resolution",
+            args={"user_query": user_query},
+            result=event_resolution.model_dump(),
+            elapsed_ms=0.0,
+        )
+
+        record_trace_call(
+            deps=deps,
             tool_name="intent_classification",
             args={"user_query": user_query},
             result=intent.model_dump(),
@@ -450,6 +458,18 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
             event_context_summary=event_context_summary,
             intent=intent,
             user_query=user_query,
+        )
+
+        record_trace_call(
+            deps=deps,
+            tool_name="retrieval_plan",
+            args={
+                "event_name": event_name,
+                "query_component": intent.component,
+                "user_query": user_query,
+            },
+            result=retrieval_plan.model_dump(),
+            elapsed_ms=0.0,
         )
 
         first_query = retrieval_plan.primary_query

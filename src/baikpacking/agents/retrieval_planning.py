@@ -10,7 +10,7 @@ def build_retrieval_plan(
     intent: QueryIntent,
     user_query: str,
 ) -> RetrievalPlan:
-    if event_resolution.canonical_name and event_resolution.match_type in {"exact", "alias"}:
+    if event_resolution.canonical_name:
         event_name_for_retrieval = event_resolution.canonical_name
     else:
         event_name_for_retrieval = event_context_summary.event_family or event_resolution.display_name

@@ -3,6 +3,14 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
+class EventCandidate(BaseModel):
+    title: str
+    canonical_name: Optional[str] = None
+    score: float = 0.0
+    match_type: str = "unknown"
+    source: str = "kb_title"
+
+
 class EventResolutionResult(BaseModel):
     raw_query_event: Optional[str] = None
     canonical_name: Optional[str] = None
@@ -11,6 +19,7 @@ class EventResolutionResult(BaseModel):
     match_type: str = "unknown"
     confidence: float = 0.0
     is_trusted_exact: bool = False
+    candidate_events: List[EventCandidate] = Field(default_factory=list)
 
 
 class EventContextSummary(BaseModel):
