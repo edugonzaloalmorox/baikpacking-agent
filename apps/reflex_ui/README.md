@@ -1,6 +1,7 @@
 # Reflex UI
 
 This is the local Reflex frontend for `bikepacking-agent`.
+It is a chat-first interface that talks to the FastAPI recommender.
 
 ## Install
 
@@ -34,5 +35,7 @@ not conflict with the FastAPI recommender on port `8000`.
 ## Notes
 
 - The UI calls `POST /recommend` on the backend.
+- The UI keeps the conversation in a single thread and hides technical details
+  behind collapsible sections.
 - The UI requests debug traces by default and renders them in a collapsible panel.
 - If the backend is unavailable, the UI shows a clean error banner instead of crashing.
