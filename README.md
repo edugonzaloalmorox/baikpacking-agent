@@ -1,126 +1,124 @@
 # bAIpacking Agent
 
-Bikepacking recommendation system built around a real end-to-end knowledge base pipeline, grounded retrieval, and LLM-assisted recommendation generation.
+## The problem
 
-## Problem
+Bikepacking setup advice is scattered across race articles, rider interviews, and equipment lists. A reviewer or rider usually wants a fast answer to questions like:
 
-Bikepacking race setup advice is scattered across article pages, rider interviews, and equipment lists. A reviewer or rider usually wants answers like:
+- What bike setup worked for this event?
+- What tyres, drivetrain, or bags fit this terrain?
+- What do similar riders actually use when exact event evidence is limited?
 
-- What bike and tire setup worked for a similar event?
-- What drivetrain or wheel choice is common for this terrain?
-- Which riders used a setup close to my event or constraints?
+This system turns that unstructured material into a searchable knowledge base and a grounded recommendation pipeline.
 
-This project turns that unstructured material into a structured database so it can be searched, filtered, embedded, and used for grounded recommendations.
+## Knowledge Base And Retrieval
 
-## What The System Does
+### Knowledge Base
 
-The project builds a searchable bikepacking knowledge base from DotWatcher [_“Bikes of …”_](https://dotwatcher.cc/features/bikes-of?) articles, then uses that knowledge base at runtime to produce recommendations for new queries.
+The active knowledge base is stored in PostgreSQL and built from DotWatcher bikepacking articles and related event context.
 
-For now, the system is best understood as a structured pipeline with LLM-assisted generation, not as a fully autonomous agent:
+Relevant pieces include:
 
-- deterministic ingestion and cleaning
-- database loading and embedding
-- retrieval over structured and vector-backed data
-- policy-based fallback when evidence is weak
-- one LLM writer stage that turns retrieved evidence into a final recommendation
+- cleaned rider records
+- article metadata
+- rider chunks
+- vector embeddings for retrieval
 
-The result is a grounded recommender that is more transparent than a pure chat app and more flexible than a fixed rules engine.
+The main runtime retrieval path uses:
 
-## Why This Project Is Interesting
+- `riders`
+- `rider_chunks`
+- `articles`
+- pgvector-backed similarity search
 
-- It has a real end-to-end KB build path, not just a demo prompt.
-- Retrieval is event-aware and falls back safely when exact evidence is missing.
-- The runtime path is modular, traceable, and testable.
-- Evaluation exists for retrieval and there is an offline response-eval path, even though the latter is still less mature.
+### Retrieval Strategy
 
-## Active Architecture
+Retrieval is event-aware and tries to stay honest about grounding strength:
 
-### KB Build Pipeline
+- `exact_event`
+  - preferred when the resolved event has direct KB coverage
+  - exact article titles and exact-scoped riders are used first
+- `similar_event`
+  - used when exact grounding is thin or unavailable but similar event families are reliable
+- `unknown_global`
+  - used when neither exact nor similar grounding is reliable enough
 
-The active knowledge-base path is:
+The recommender also tracks policy modes to set the "tone" of the recommendation and prevent hallucinations.
 
-```text
-src/baikpacking/scraper/clean_json.py
--> src/baikpacking/pipelines/scrape_dotwatcher.py
--> src/baikpacking/db/data_loader.py
--> src/baikpacking/pipelines/embed_index.py
--> src/baikpacking/embedding/embed.py
--> src/baikpacking/tools/riders.py
-```
+- `strict_grounded`
+- `pattern_based`
+- `generic_fallback`
 
-What each stage does:
+Those policy modes control how much event-specific language and specificity the writer may use.
 
-- `src/baikpacking/scraper/clean_json.py`: cleans and normalizes DotWatcher article text into rider records
-- `src/baikpacking/pipelines/scrape_dotwatcher.py`: scrapes new DotWatcher “Bikes of …” pages and writes snapshots
-- `src/baikpacking/db/data_loader.py`: loads cleaned rider data into PostgreSQL
-- `src/baikpacking/pipelines/embed_index.py`: embeds riders into the vector index
-- `src/baikpacking/embedding/embed.py`: talks to Ollama and builds embedding vectors
-- `src/baikpacking/tools/riders.py`: runtime retrieval over riders and evidence chunks
+### Known Limitations
 
-### Runtime Recommender
+- Some events are not present in the KB.
+- Some exact-event pages have sparse rider coverage, so the system can still fall back to similar events.
+- Retrieval is deterministic, but exact vs similar coverage is still an active area of calibration.
 
-The current runtime recommender is centered on:
+## Agents And LLM
 
-- `src/baikpacking/agents/recommender_agent.py`
-- supporting modules under `src/baikpacking/agents/`
-- runtime entrypoint `src/baikpacking/scripts/run_recommender.py`
+The runtime recommender is centered on `src/baikpacking/agents/recommender_agent.py` and the supporting modules under `src/baikpacking/agents/`.
 
-The recommender is a staged system. It performs:
+Current runtime flow:
 
 1. event resolution
 2. query intent classification
-3. event context resolution
+3. event web context lookup
 4. retrieval planning
-5. pgvector / structured rider search
+5. rider search
 6. evidence summarization
-7. policy selection and fallback
-8. postprocessing and output validation
-9. final LLM-assisted response writing
+7. policy selection
+8. writer draft generation
+9. deterministic postprocessing and validation
 
-The tools are not an open-ended autonomous loop. They are modular stages with clear responsibilities and trace logging.
+The architecture is intentionally small:
 
-### Supporting Modules
+- `event_resolution.py` resolves aliases and canonical event names
+- `event_context_resolution.py` fetches event-level context
+- `retrieval_planning.py` decides the retrieval query shape
+- `tools/riders.py` does the actual rider retrieval
+- `evidence_summary.py` summarizes evidence strength
+- `policy.py` selects `strict_grounded`, `pattern_based`, or `generic_fallback`
+- `writer_input.py` defines the writer-facing input contract
+- `models.py` defines the minimal `WriterRecommendationDraft`
+- `review_feedback.py` loads optional human review hints
+- `postprocess.py` and `output_validation.py` assemble and validate the final output
 
-The runtime path uses these modules heavily:
-
-- `src/baikpacking/agents/event_resolution.py`
-- `src/baikpacking/agents/event_context_resolution.py`
-- `src/baikpacking/agents/query_intent.py`
-- `src/baikpacking/agents/retrieval_planning.py`
-- `src/baikpacking/agents/evidence_summary.py`
-- `src/baikpacking/agents/policy.py`
-- `src/baikpacking/agents/postprocess.py`
-- `src/baikpacking/agents/output_validation.py`
-- `src/baikpacking/tools/pg_vector_search.py`
-- `src/baikpacking/tools/riders.py`
-
-## Tools And Components
-
-- `PostgreSQL + pgvector`: stores structured riders and vector embeddings
-- `Ollama`: provides the embedding model used during KB indexing
-- `Pydantic AI`: wraps the writer step and instrumentation
-- `Logfire`: captures tracing when configured
-- `Docker Compose`: runs local Postgres
-- `uv`: reproducible Python dependency management and execution
+The writer stage does not own the full final recommendation object. It produces a compact draft, and code assembles the final `SetupRecommendation`.
 
 ## Repository Structure
 
-- `src/baikpacking/agents/`: runtime orchestration, policy, validation, and writer logic
-- `src/baikpacking/pipelines/`: KB ingestion and embedding pipelines
-- `src/baikpacking/scraper/`: scraping and cleaning of DotWatcher data
-- `src/baikpacking/db/`: schema, loaders, and DB connections
-- `src/baikpacking/embedding/`: embedding config and Ollama client
-- `src/baikpacking/tools/`: retrieval, tracing, and event-context utilities
-- `src/baikpacking/scripts/`: runnable entrypoints
-- `tests/`: unit and smoke tests for the active code path
-- `data/`: current snapshots, cached eval artifacts, and generated outputs
-- `archive/`: legacy retrieval, eval, notebooks, and older code paths kept for reference
+Important directories and entrypoints:
 
-## Setup
+- `src/baikpacking/agents/`
+  - runtime orchestration, policy, postprocessing, validation, review feedback, and writer contracts
+- `src/baikpacking/tools/`
+  - rider retrieval, event context helpers, tracing, and pgvector search
+- `src/baikpacking/pipelines/`
+  - KB scraping, cleaning, loading, and embedding workflows
+- `src/baikpacking/scraper/`
+  - DotWatcher scraping and cleaning utilities
+- `src/baikpacking/db/`
+  - schema and database helpers
+- `src/baikpacking/embedding/`
+  - embedding configuration and Ollama client
+- `src/baikpacking/apps/eval_dashboard.py`
+  - local Streamlit eval dashboard
+- `src/baikpacking/scripts/run_recommender.py`
+  - runtime smoke path and sample eval row writer
+- `src/baikpacking/scripts/run_eval_scenarios.py`
+  - manual scenario evaluation runner
+- `tests/`
+  - unit, regression, writer, policy, retrieval, and scenario-eval tests
+- `data/eval/`
+  - scenario input/output artifacts, cached context, and human review JSONL files
+- `archive/`
+  - legacy code and older evaluation artifacts kept for reference
+
+## Setup And Reproducibility
 
 ### 1. Install Dependencies
-
-Use the lockfile-based workflow:
 
 ```bash
 uv sync
@@ -128,18 +126,12 @@ uv sync
 
 ### 2. Configure Environment
 
-Create or edit `.env` with your local values. The code reads these common variables:
+Create or edit `.env` with local values. Common variables include:
 
 - `DATABASE_URL`
 - `EMB_EMBEDDING_MODEL`
 - `OLLAMA_HOST`
-- `LOG_LEVEL`
 - `LOGFIRE_TOKEN`
-- `AGENT_WRITER_MODEL`
-- `EVENT_CONTEXT_CACHE_PATH`
-- `EVENT_CONTEXT_CACHE_TTL_S`
-
-Typical local defaults are already present in code, but the project still expects a usable local database and embedding runtime.
 
 ### 3. Start Local Services
 
@@ -148,130 +140,209 @@ make pg-up
 make ollama-up
 ```
 
-If `EMB_EMBEDDING_MODEL` is not already set, export it before starting Ollama:
+If needed, set the embedding model before starting Ollama:
 
 ```bash
 export EMB_EMBEDDING_MODEL=mxbai-embed-large:335m
 ```
 
-## How To Run The KB Pipeline
+For a one-shot local bootstrap, `make dev` is available.
 
-The shortest path is:
+## Run The KB Pipeline
 
-```bash
-make kb-update
-```
-
-That command runs the active incremental KB flow:
+The active KB flow is:
 
 ```text
 scrape -> clean -> load -> embed
 ```
 
-Useful subcommands:
+Run the full pipeline:
 
 ```bash
-make kb-scrape   # scrape new DotWatcher articles
-make kb-clean    # clean the latest raw snapshot
-make kb-load     # load the latest cleaned snapshot into Postgres
-make kb-embed    # embed riders into pgvector
-make kb-check    # show latest snapshot files
-make kb-status   # show row counts and missing embeddings
+make kb-update
 ```
 
-For a one-shot local bootstrap:
 
-```bash
-make dev
-```
+## Run The Recommender
 
-## How To Run The Recommender
-
-Run the current runtime entrypoint with:
+Run the current runtime entrypoint:
 
 ```bash
 uv run python -m baikpacking.scripts.run_recommender
 ```
 
-This:
+This prints:
 
-- runs the recommender on a sample query
-- prints the recommendation and tool trace
-- appends a JSONL row to `data/eval/sample_eval_rows.jsonl`
+- the recommendation
+- the retrieved grounding riders
+- the tool trace
 
-The recommender implementation lives in:
+It also appends a small runtime eval row to `data/eval/sample_eval_rows.jsonl`.
 
-- `src/baikpacking/agents/recommender_agent.py`
-- `src/baikpacking/scripts/run_recommender.py`
+## HTTP API
+
+The repository now includes a small FastAPI wrapper around the existing
+recommendation pipeline.
+
+Run it locally:
+
+```bash
+uv run uvicorn baikpacking.api.main:app --host 0.0.0.0 --port 8000
+```
+
+Run it in Docker:
+
+```bash
+docker build -t baikpacking-api .
+docker run --rm -p 8000:8000 --env-file .env baikpacking-api
+```
+
+Quick curl examples:
+
+```bash
+curl http://localhost:8000/health
+curl http://localhost:8000/ready
+curl -X POST http://localhost:8000/recommend \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"What tyres should I use for Atlas Mountain Race?","include_debug":true}'
+```
+
+The `POST /recommend` response includes the query, resolved event, intent,
+recommendation, evidence, policy, and optional debug trace data.
+`GET /health` is a liveness check; `GET /ready` verifies database connectivity.
+Each live `/recommend` request also appends a deterministic live-eval row to
+`data/eval/live_runs.jsonl`.
+
+## Reflex UI
+
+A local Reflex frontend lives in `apps/reflex_ui/`.
+
+Run it with the backend API running locally:
+
+```bash
+cd apps/reflex_ui
+API_BASE_URL=http://127.0.0.1:8000 uv run reflex run
+```
+
+The UI renders the `/recommend` response as a chat-first assistant with
+collapsed technical details. See `apps/reflex_ui/README.md` for a shorter
+setup note.
 
 ## Testing
 
-The active test suite is under `tests/`.
+The test suite lives under `tests/`.
 
-Run all tests:
+Run everything:
 
 ```bash
 uv run pytest
 ```
 
-Run a focused smoke test for the runtime recommender:
+Useful focused subsets:
 
 ```bash
-uv run pytest tests/test_recommender.py -q
+uv run pytest tests/test_event_resolution.py tests/test_event_context_resolution.py tests/test_retrieval_planning.py
+uv run pytest tests/test_policy.py tests/test_writer_stage.py tests/test_agents_writer_input.py
+uv run pytest tests/test_eval_scenario_content_assertions.py tests/test_review_feedback.py
+uv run pytest tests/test_riders.py tests/test_recommender.py
 ```
 
-The tests cover event resolution, query intent, retrieval planning, policy behavior, evidence summarization, output validation, and a recommender smoke path.
+What these tests cover:
+
+- event resolution and alias handling
+- event context and retrieval planning
+- rider retrieval and evidence summarization
+- policy selection and fallback behavior
+- writer-stage contract stability
+- manual scenario assertions
+- human review storage and matching
 
 ## Evaluation
 
-Evaluation is split into two levels.
+Evaluation is deterministic first, with optional human review on top.
 
-### Current Active Evaluation
+### Manual Scenario Evaluation
 
-The current runtime evaluation artifact is the sample JSONL row written by:
+The manual scenario contract lives in:
 
-```bash
-uv run python -m baikpacking.scripts.run_recommender
-```
+- `data/eval/manual_scenarios.yaml`
 
-That file captures:
-
-- the user question
-- the model answer
-- the structured output
-- the tool trace
-
-This is useful for offline inspection and response-quality review, but it is still a lightweight evaluation path.
-
-The manual scenario runner writes a richer per-run record to `data/eval/scenario_runs.jsonl` from:
+Run the scenario suite with:
 
 ```bash
 uv run python -m baikpacking.scripts.run_eval_scenarios
 ```
 
-Those rows now include the scenario contract fields, runtime policy/retrieval metadata, content assertions, event-alignment assertions, and failure classification such as `output_schema_failure`.
+That runner writes per-scenario results to:
 
-For a quick local view of that file, launch the eval dashboard:
+- `data/eval/scenario_runs.jsonl`
+
+Each run records:
+
+- scenario contract fields
+- resolved event and intent
+- retrieval source and policy mode
+- content assertion results
+- event alignment assertion results
+- failure kind and runtime/schema stability
+
+The current deterministic checks cover:
+
+- content assertions
+- event alignment
+- schema/runtime stability
+- failure classification such as `output_schema_failure`
+
+There is no LLM judge in this flow.
+
+### Eval Dashboard
+
+Open the local eval dashboard with:
 
 ```bash
-streamlit run src/baikpacking/apps/eval_dashboard.py
+uv run streamlit run src/baikpacking/apps/eval_dashboard.py
 ```
 
-### Retrieval Evaluation
+The dashboard reads:
 
-To DO
+- `data/eval/scenario_runs.jsonl`
+
+It shows:
+
+- summary cards
+- failure and issue breakdowns
+- drill-down rows
+- selected-row details
+
+### Human Review Loop
+
+The dashboard also supports reviewer feedback.
+
+Saved reviews are stored separately in:
+
+- `data/eval/scenario_reviews.jsonl`
+
+Each review can include:
+
+- `review_status`
+- `human_label`
+- `corrected_event`
+- `corrected_component`
+- `corrected_policy_mode`
+- `review_notes`
+
+The recommender loads matching review hints at runtime for the same event/component combination and uses them as prompt context. Reviews are not treated as hard labels or a learned model.
 
 ## Monitoring And Tracing
 
 The project has developer-facing tracing, not a full production monitoring stack.
 
-What is available:
+Available instrumentation:
 
 - `src/baikpacking/logging_config.py` configures standard logging and Logfire
-- `LOGFIRE_TOKEN` enables sending traces to Logfire
 - `pydantic_ai` instrumentation captures agent runs and tool calls
-- `src/baikpacking/tools/call_trace.py` records tool-call traces inside the runtime path
-- `src/baikpacking/scripts/run_recommender.py` prints the tool trace and stores it in JSONL
+- `src/baikpacking/tools/call_trace.py` records tool-call traces in the runtime path
+- `src/baikpacking/scripts/run_recommender.py` prints the tool trace and stores a sample runtime eval row
 - `make kb-status` gives a quick DB health check by counting riders and embeddings
 
 Typical inspection flow:
@@ -281,30 +352,28 @@ uv run python -m baikpacking.scripts.run_recommender
 make kb-status
 ```
 
-If `LOGFIRE_TOKEN` is configured, inspect traces in the Logfire project linked to that token. If it is not configured, tracing remains local.
+If `LOGFIRE_TOKEN` is configured, inspect traces in Logfire. Otherwise tracing remains local.
 
-## Reproducibility
+## Current Status
 
-To reproduce the current local setup:
+What is working well:
 
-1. Install dependencies with `uv sync`
-2. Start Postgres with `make pg-up`
-3. Start Ollama with `make ollama-up`
-4. Set the needed environment variables in `.env`
-5. Build or refresh the KB with `make kb-update`
-6. Run the recommender with `uv run python -m baikpacking.scripts.run_recommender`
-7. Run tests with `uv run pytest`
+- the KB build path is real and reproducible
+- the writer/output contract is small and stable
+- the eval runner produces structured JSONL artifacts
+- the dashboard supports manual inspection and reviewer feedback
 
-This is intentionally a local, reproducible workflow rather than a cloud-deployed system.
+What is still being improved:
 
-## Limitations And Future Improvements
-
-- The system is not fully agentic; it is a structured pipeline with an LLM writer stage.
-- Final answers are grounded, but source-level citation support is still limited.
-- Response evaluation exists, but it is less mature than retrieval evaluation.
-- Runtime and eval retrieval backends are not fully unified.
-- Monitoring is present through logs and Logfire, but the documentation and production controls are still thin.
+- exact-event vs similar-event alignment in thinly covered events
+- scenario calibration for strict event-alignment cases
+- broader KB coverage for events that are not well represented in the source data
 
 ## Notes For Reviewers
 
-- The active repo is centered on the cleaned KB pipeline and the runtime recommender path for now.
+- Run the app: `uv run python -m baikpacking.scripts.run_recommender`
+- Run eval: `uv run python -m baikpacking.scripts.run_eval_scenarios`
+- Open the dashboard: `uv run streamlit run src/baikpacking/apps/eval_dashboard.py`
+- Inspect eval output: `data/eval/scenario_runs.jsonl`
+- Inspect reviewer feedback: `data/eval/scenario_reviews.jsonl`
+- Inspect runtime smoke logs: `data/eval/sample_eval_rows.jsonl`
