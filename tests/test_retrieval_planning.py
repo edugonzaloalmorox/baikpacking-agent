@@ -119,3 +119,32 @@ def test_build_retrieval_plan_component_query_matches_previous_shape():
     assert plan.primary_query is not None
     assert "Focus: bikepacking bags" in plan.primary_query
     assert plan.fallback_query == plan.descriptor_query
+
+
+def test_build_retrieval_plan_disables_exact_event_when_guard_requires_it():
+    event_resolution = EventResolutionResult(
+        display_name="Atlas Mountain Race",
+        canonical_name="Atlas Mountain Race",
+        match_type="exact",
+        confidence=0.98,
+        is_trusted_exact=True,
+    )
+    event_context_summary = EventContextSummary(
+        requested_event_name="Atlas Mountain Race",
+        web_context_text="Remote mountain ultra",
+        event_family="mountain gravel ultra",
+        archetype="mountain_offroad_ultra",
+        surface_family="mixed_offroad",
+    )
+    intent = QueryIntent(component="full_setup", confidence=0.25, component_terms=[])
+
+    plan = build_retrieval_plan(
+        event_resolution=event_resolution,
+        event_context_summary=event_context_summary,
+        intent=intent,
+        user_query="Recommend a setup for Atlas Mountain Race",
+        allow_exact_grounding=False,
+    )
+
+    assert plan.use_exact_event is False
+    assert plan.event_name_for_retrieval == "Atlas Mountain Race"

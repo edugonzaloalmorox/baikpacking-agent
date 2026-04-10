@@ -9,8 +9,10 @@ def build_retrieval_plan(
     event_context_summary: EventContextSummary,
     intent: QueryIntent,
     user_query: str,
+    *,
+    allow_exact_grounding: bool = True,
 ) -> RetrievalPlan:
-    if event_resolution.canonical_name:
+    if event_resolution.canonical_name and _normalized_match_type(event_resolution) in {"exact", "alias", "trusted_exact"}:
         event_name_for_retrieval = event_resolution.canonical_name
     else:
         event_name_for_retrieval = event_context_summary.event_family or event_resolution.display_name
@@ -36,7 +38,7 @@ def build_retrieval_plan(
 
     return RetrievalPlan(
         query_component=intent.component,
-        use_exact_event=event_resolution.is_trusted_exact,
+        use_exact_event=bool(allow_exact_grounding and event_resolution.is_trusted_exact),
         event_name_for_retrieval=event_name_for_retrieval,
         descriptor_query=descriptor["descriptor_query"],
         descriptor_query_with_intent=descriptor["descriptor_query_with_intent"],
@@ -45,3 +47,7 @@ def build_retrieval_plan(
         fallback_reasoning=fallback_reasoning,
         intent_bundle=intent_bundle,
     )
+
+
+def _normalized_match_type(event_resolution: EventResolutionResult) -> str:
+    return str(event_resolution.match_type).strip().lower()

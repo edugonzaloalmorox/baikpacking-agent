@@ -1,11 +1,13 @@
 """Pydantic schemas for the bikepacking HTTP API."""
 
+from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from baikpacking.agents.models import QueryIntent, SetupRecommendation
+from baikpacking.agents.guardrails import GuardDecision
 from baikpacking.agents.orchestration_models import (
     EvidenceSummary,
     EventResolutionResult,
@@ -46,11 +48,14 @@ class RecommendResponse(BaseModel):
     """Structured recommendation response."""
 
     query: str
-    resolved_event: EventResolutionResult
-    intent: QueryIntent
-    recommendation: SetupRecommendation
-    evidence: EvidenceSummary
-    policy: RecommendationPolicy
+    status: Literal["success", "skipped"] = "success"
+    message: Optional[str] = None
+    guard: Optional[GuardDecision] = None
+    resolved_event: Optional[EventResolutionResult] = None
+    intent: Optional[QueryIntent] = None
+    recommendation: Optional[SetupRecommendation] = None
+    evidence: Optional[EvidenceSummary] = None
+    policy: Optional[RecommendationPolicy] = None
     debug: Optional[RecommendationDebug] = None
 
 
