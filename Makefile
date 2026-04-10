@@ -6,6 +6,9 @@ PY ?= python
 -include .env
 export
 
+# -------------------------
+# General configuration
+# -------------------------
 
 PG_PORT ?= 5433
 PG_CONTAINER ?= baikpacking-postgres
@@ -13,11 +16,91 @@ PG_USER ?= baikpacking
 PG_DB ?= baikpacking
 PG_VOLUME ?= pg_data
 
+API_PORT ?= 8001
+REFLEX_FRONTEND_PORT ?= 3000
+REFLEX_BACKEND_PORT ?= 8000
+API_BASE_URL ?= http://127.0.0.1:$(API_PORT)
+
+DATA_DIR := data
+SNAP_RAW_DIR := $(DATA_DIR)/snapshots/raw
+SNAP_CLEAN_DIR := $(DATA_DIR)/snapshots/clean
+
+RAW_SNAP_GLOB := dotwatcher_bikes_raw_new_*.jsonl
+CLEAN_SNAP_GLOB := dotwatcher_bikes_cleaned_new_*.json
+
 # -------------------------
-# Docker (Postgres / infra)
+# Phony targets
 # -------------------------
 
-.PHONY: docker-up docker-check pg-up pg-check pg-reset
+.PHONY: \
+	help \
+	check-env \
+	docker-check docker-up \
+	pg-up pg-check pg-reset \
+	ollama-up ollama-check \
+	kb-scrape kb-clean kb-load kb-embed kb-update kb-check kb-backfill kb-load-file kb-status \
+	up dev \
+	api ui app stop-app stop-ports
+
+# -------------------------
+# Help
+# -------------------------
+
+help:
+	@echo ""
+	@echo "Environment:"
+	@echo "  make check-env   validate OPENAI_API_KEY formatting"
+	@echo ""
+	@echo "Docker / Postgres:"
+	@echo "  make docker-check check Docker daemon"
+	@echo "  make docker-up    start Docker Desktop if needed"
+	@echo "  make pg-up        start Postgres via docker compose"
+	@echo "  make pg-check     verify Postgres container and readiness"
+	@echo "  make pg-reset     destroy Postgres volume and reset DB"
+	@echo ""
+	@echo "Ollama:"
+	@echo "  make ollama-up    start Ollama and pull embedding model"
+	@echo "  make ollama-check verify Ollama status"
+	@echo ""
+	@echo "Knowledge base:"
+	@echo "  make kb-scrape    run incremental scraper"
+	@echo "  make kb-clean     clean latest raw snapshot"
+	@echo "  make kb-load      load latest cleaned snapshot into DB"
+	@echo "  make kb-embed     generate embeddings"
+	@echo "  make kb-update    scrape -> clean -> load -> embed"
+	@echo "  make kb-check     show latest snapshot files"
+	@echo "  make kb-backfill  load full cleaned dataset"
+	@echo "  make kb-load-file FILE=path/to/file.json"
+	@echo "  make kb-status    inspect DB counts"
+	@echo ""
+	@echo "App:"
+	@echo "  make api          run FastAPI backend on port $(API_PORT)"
+	@echo "  make ui           run Reflex frontend"
+	@echo "  make app          run FastAPI + Reflex together"
+	@echo "  make stop-app     stop ports $(REFLEX_FRONTEND_PORT), $(REFLEX_BACKEND_PORT), $(API_PORT)"
+	@echo ""
+	@echo "Bootstrap:"
+	@echo "  make up           pg-up + ollama-up + kb-update"
+	@echo "  make dev          prepare infra and KB for development"
+	@echo ""
+
+# -------------------------
+# Environment checks
+# -------------------------
+
+check-env:
+	@echo "Checking OPENAI_API_KEY format..."
+	@if echo "$(OPENAI_API_KEY)" | grep -q "^'"; then \
+		echo "❌ OPENAI_API_KEY starts with a quote"; exit 1; \
+	fi
+	@if echo "$(OPENAI_API_KEY)" | grep -q "'$$"; then \
+		echo "❌ OPENAI_API_KEY ends with a quote"; exit 1; \
+	fi
+	@echo "✅ OPENAI_API_KEY format looks correct"
+
+# -------------------------
+# Docker
+# -------------------------
 
 docker-check:
 	@docker info >/dev/null 2>&1 && \
@@ -43,9 +126,7 @@ docker-up:
 	@echo ""
 
 # -------------------------
-# Postgres (pgvector) via docker compose
-# Assumes your docker-compose.yml defines a `postgres` service
-# and (optionally) a named volume like `pg_data`.
+# Postgres
 # -------------------------
 
 pg-up: docker-up
@@ -53,7 +134,7 @@ pg-up: docker-up
 	@echo "🐘 [pg] Starting Postgres (docker compose up -d postgres)..."
 	@docker compose up -d postgres
 	@echo "⏳ [pg] Waiting for Postgres health/ready..."
-	@until docker exec -i baikpacking-postgres pg_isready -U baikpacking -d baikpacking >/dev/null 2>&1; do \
+	@until docker exec -i $(PG_CONTAINER) pg_isready -U $(PG_USER) -d $(PG_DB) >/dev/null 2>&1; do \
 		sleep 2; \
 		echo "  ... waiting"; \
 	done
@@ -75,8 +156,6 @@ pg-check: docker-up
 		( echo "❌ Postgres not ready"; exit 1 )
 	@echo ""
 
-# WARNING: This will destroy your DB data if you use a named volume.
-# It stops containers and removes the Postgres volume.
 pg-reset: docker-up
 	@echo ""
 	@echo "⚠️  [pg] RESET requested: this will DELETE the Postgres data volume."
@@ -86,13 +165,9 @@ pg-reset: docker-up
 	@echo "👉 Run: make pg-up"
 	@echo ""
 
-
-
 # -------------------------
-# Ollama (embeddings)
+# Ollama
 # -------------------------
-
-.PHONY: ollama-up ollama-check
 
 ollama-up:
 	@echo ""
@@ -161,28 +236,8 @@ ollama-check:
 	@echo ""
 
 # -------------------------
-# KB incremental
+# Knowledge base
 # -------------------------
-
-DATA_DIR := data
-SNAP_RAW_DIR := $(DATA_DIR)/snapshots/raw
-SNAP_CLEAN_DIR := $(DATA_DIR)/snapshots/clean
-
-RAW_SNAP_GLOB := dotwatcher_bikes_raw_new_*.jsonl
-CLEAN_SNAP_GLOB := dotwatcher_bikes_cleaned_new_*.json
-
-.PHONY: help kb-update kb-scrape kb-clean kb-load kb-embed kb-check
-
-help:
-	@echo ""
-	@echo "KB incremental:"
-	@echo "  make kb-update   scrape -> (if new) clean -> (if new) load -> (if new) embed"
-	@echo "  make kb-scrape   run incremental scraper (raw new-only snapshots)"
-	@echo "  make kb-clean    clean latest raw new-only snapshot + merge latest cleaned"
-	@echo "  make kb-load     load latest cleaned new-only snapshot into DB"
-	@echo "  make kb-embed    embed riders into pgvector (incremental by default)"
-	@echo "  make kb-check    show latest snapshot files"
-	@echo ""
 
 kb-scrape:
 	$(UV) $(PY) -m baikpacking.pipelines.scrape_dotwatcher
@@ -232,23 +287,26 @@ kb-check:
 	@ls -1t $(SNAP_CLEAN_DIR)/$(CLEAN_SNAP_GLOB) 2>/dev/null | head -n 3 || true
 	@echo ""
 
-.PHONY: kb-backfill
 kb-backfill:
 	$(UV) $(PY) -m baikpacking.db.data_loader --input data/dotwatcher_bikes_cleaned.json
 
-.PHONY: kb-load-file
 kb-load-file:
 	@if [[ -z "$(FILE)" ]]; then echo "Usage: make kb-load-file FILE=path/to/snapshot.json"; exit 1; fi
 	$(UV) $(PY) -m baikpacking.db.data_loader --input "$(FILE)"
 
-.PHONY: up
+kb-status:
+	@echo ""
+	@echo "📊 [status] Checking database state..."
+	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT COUNT(*) AS total_riders FROM riders;" || true
+	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT COUNT(*) AS total_embeddings FROM rider_embeddings;" || true
+	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT COUNT(*) AS riders_missing_embeddings FROM riders r LEFT JOIN rider_embeddings e ON r.id = e.rider_id WHERE e.rider_id IS NULL;" || true
+	@echo ""
+
+# -------------------------
+# Bootstrap
+# -------------------------
+
 up: pg-up ollama-up kb-update
-
-# -------------------------
-# Dev bootstrap
-# -------------------------
-
-.PHONY: dev kb-status
 
 dev:
 	@echo ""
@@ -261,10 +319,45 @@ dev:
 	@echo "✅ Dev environment ready."
 	@echo ""
 
-kb-status:
+# -------------------------
+# App
+# -------------------------
+
+api:
 	@echo ""
-	@echo "📊 [status] Checking database state..."
-	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT COUNT(*) AS total_riders FROM riders;" || true
-	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT COUNT(*) AS total_embeddings FROM rider_embeddings;" || true
-	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT COUNT(*) AS riders_missing_embeddings FROM riders r LEFT JOIN rider_embeddings e ON r.id = e.rider_id WHERE e.rider_id IS NULL;" || true
+	@echo "⚡ [api] Starting FastAPI on port $(API_PORT)..."
+	@$(UV) uvicorn src.baikpacking.api.main:app --reload --port $(API_PORT)
+
+ui: check-env
 	@echo ""
+	@echo "🎨 [ui] Starting Reflex UI..."
+	@echo "    Frontend: http://localhost:$(REFLEX_FRONTEND_PORT)"
+	@echo "    Reflex backend: http://localhost:$(REFLEX_BACKEND_PORT)"
+	@echo "    API_BASE_URL=$(API_BASE_URL)"
+	@cd apps/reflex_ui && API_BASE_URL=$(API_BASE_URL) reflex run
+
+app: check-env
+	@echo ""
+	@echo "🚀 Starting FastAPI + Reflex UI..."
+	@echo "    FastAPI:        http://127.0.0.1:$(API_PORT)"
+	@echo "    Reflex UI:      http://localhost:$(REFLEX_FRONTEND_PORT)"
+	@echo "    Reflex backend: http://localhost:$(REFLEX_BACKEND_PORT)"
+	@trap 'kill 0' INT TERM EXIT; \
+	($(UV) uvicorn src.baikpacking.api.main:app --reload --port $(API_PORT)) & \
+	(cd apps/reflex_ui && API_BASE_URL=$(API_BASE_URL) reflex run) & \
+	wait
+
+stop-app:
+	@echo ""
+	@echo "🛑 Stopping app ports..."
+	-@kill -9 $$(lsof -ti:$(REFLEX_FRONTEND_PORT)) 2>/dev/null || true
+	-@kill -9 $$(lsof -ti:$(REFLEX_BACKEND_PORT)) 2>/dev/null || true
+	-@kill -9 $$(lsof -ti:$(API_PORT)) 2>/dev/null || true
+	@echo "✅ Stopped ports $(REFLEX_FRONTEND_PORT), $(REFLEX_BACKEND_PORT), $(API_PORT)"
+	@echo ""
+
+stop-ports: stop-app
+
+
+
+
