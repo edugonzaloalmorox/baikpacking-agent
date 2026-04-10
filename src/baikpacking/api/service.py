@@ -1,13 +1,16 @@
 """Service layer for the bikepacking HTTP API."""
 
-
+from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+import time
+from typing import Any, Mapping, Optional
 
 import anyio
 
 from baikpacking.agents.models import QueryIntent
+from baikpacking.agents.guardrails import RecommendationGuardBlocked
+from baikpacking.agents.live_evaluation import append_live_run, build_live_run_record
 from baikpacking.agents.orchestration_models import (
     EvidenceSummary,
     EventResolutionResult,
@@ -119,40 +122,110 @@ class RecommendationService:
             raise ApiServiceError(f"database not ready: {exc}", status_code=503) from exc
         return ReadyResponse(database=database)
 
-    async def recommend(self, request: RecommendRequest) -> RecommendResponse:
+    async def recommend(
+        self,
+        request: RecommendRequest,
+        *,
+        request_meta: Mapping[str, Any] | None = None,
+    ) -> RecommendResponse:
         query = request.query.strip()
-        if not query:
-            raise ApiServiceError("query must not be empty", status_code=400)
-
-        logger.info("recommend_request query=%r include_debug=%s", query, request.include_debug)
+        status = "success"
+        error_text: str | None = None
+        response_payload: dict[str, Any] | None = None
+        trace: Any = None
+        started = time.perf_counter()
 
         try:
-            recommendation, trace = await anyio.to_thread.run_sync(recommend_setup_with_trace, query)
-        except Exception as exc:
-            logger.exception("recommendation failed for query=%r", query)
-            raise ApiServiceError(f"recommendation failed: {exc}", status_code=503) from exc
+            if not query:
+                status = "failure"
+                error_text = "query must not be empty"
+                raise ApiServiceError(error_text, status_code=400)
 
-        event_resolution = _model_from_trace(
-            trace,
-            "event_resolution",
-            EventResolutionResult,
-            _default_event_resolution(query, recommendation.event),
-        )
-        intent = _model_from_trace(trace, "intent_classification", QueryIntent, _default_intent())
-        evidence = _model_from_trace(trace, "evidence_summary", EvidenceSummary, _default_evidence())
-        policy = _model_from_trace(trace, "policy_selection", RecommendationPolicy, _default_policy())
+            logger.info("recommend_request query=%r include_debug=%s", query, request.include_debug)
 
-        debug = _build_debug(trace) if request.include_debug else None
+            try:
+                recommendation, trace = await anyio.to_thread.run_sync(recommend_setup_with_trace, query)
+            except RecommendationGuardBlocked as exc:
+                logger.info(
+                    "recommendation skipped for query=%r guard_type=%s",
+                    query,
+                    exc.decision.guard_type,
+                )
+                status = "skipped"
+                trace = exc.trace
+                response = RecommendResponse(
+                    query=query,
+                    status="skipped",
+                    message=exc.decision.user_message or exc.decision.reason,
+                    guard=exc.decision,
+                )
+                response_payload = response.model_dump(mode="json")
+                return response
+            except Exception as exc:
+                logger.exception("recommendation failed for query=%r", query)
+                status = "failure"
+                error_text = f"recommendation failed: {exc}"
+                raise ApiServiceError(error_text, status_code=503) from exc
 
-        return RecommendResponse(
+            event_resolution = _model_from_trace(
+                trace,
+                "event_resolution",
+                EventResolutionResult,
+                _default_event_resolution(query, recommendation.event),
+            )
+            intent = _model_from_trace(trace, "intent_classification", QueryIntent, _default_intent())
+            evidence = _model_from_trace(trace, "evidence_summary", EvidenceSummary, _default_evidence())
+            policy = _model_from_trace(trace, "policy_selection", RecommendationPolicy, _default_policy())
+
+            debug = _build_debug(trace) if request.include_debug else None
+            response = RecommendResponse(
+                query=query,
+                resolved_event=event_resolution,
+                intent=intent,
+                recommendation=recommendation,
+                evidence=evidence,
+                policy=policy,
+                debug=debug,
+            )
+
+            response_payload = response.model_dump(mode="json")
+            return response
+        finally:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            await self._write_live_eval(
+                query=query,
+                status=status,
+                error_text=error_text,
+                response_payload=response_payload,
+                trace=trace,
+                latency_ms=latency_ms,
+                request_meta=request_meta,
+            )
+
+    async def _write_live_eval(
+        self,
+        *,
+        query: str,
+        status: str,
+        error_text: str | None,
+        response_payload: dict[str, Any] | None,
+        trace: Any,
+        latency_ms: float,
+        request_meta: Mapping[str, Any] | None = None,
+    ) -> None:
+        record = build_live_run_record(
             query=query,
-            resolved_event=event_resolution,
-            intent=intent,
-            recommendation=recommendation,
-            evidence=evidence,
-            policy=policy,
-            debug=debug,
+            status=status,
+            error=error_text,
+            response=response_payload,
+            trace=trace,
+            latency_ms=latency_ms,
+            request_meta=request_meta,
         )
+        try:
+            await anyio.to_thread.run_sync(append_live_run, record)
+        except Exception:
+            logger.exception("failed to persist live eval row")
 
 
 _SERVICE = RecommendationService()
