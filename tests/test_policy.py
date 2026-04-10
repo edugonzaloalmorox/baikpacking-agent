@@ -140,6 +140,22 @@ def test_similar_event_medium_evidence_uses_pattern_based():
     assert "similar_event_retrieval" in policy.notes
 
 
+def test_exact_event_downgrades_when_exact_grounding_is_disabled():
+    policy = select_policy(
+        event_match_type="exact",
+        matched_event_name="Atlas Mountain Race",
+        retrieval_source="exact_event",
+        exact_event_hit_count=3,
+        evidence_strength="strong",
+        allow_exact_grounding=False,
+    )
+
+    assert policy.mode == "pattern_based"
+    assert policy.allow_specific_brands is False
+    assert policy.allow_event_specific_claims is False
+    assert "exact_grounding_disabled" in policy.notes
+
+
 def test_pirenaica_exact_retrieval_overrides_unknown_parser_match(monkeypatch):
     from baikpacking.agents import recommender_agent as mod
 
@@ -225,8 +241,8 @@ def test_pirenaica_exact_retrieval_overrides_unknown_parser_match(monkeypatch):
     assert policy_calls, "expected a policy_selection trace entry"
     policy_result = policy_calls[-1]["result"]
 
-    assert policy_result["mode"] == "strict_grounded"
+    assert policy_result["mode"] == "pattern_based"
     assert "unknown_event" not in policy_result["notes"]
-    assert policy_result["allow_event_specific_claims"] is True
+    assert policy_result["allow_event_specific_claims"] is False
     assert rec.summary == "Grounded summary"
     assert rec.tyres == "45mm semi-slick"
