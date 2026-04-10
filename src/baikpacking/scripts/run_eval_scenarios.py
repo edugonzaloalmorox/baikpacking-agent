@@ -11,6 +11,7 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from baikpacking.agents.live_evaluation import classify_failure_kind
 from baikpacking.agents.recommender_agent import recommend_setup_with_trace
 
 load_dotenv()
@@ -269,7 +270,7 @@ def _scenario_event_grounding_mode(run: Mapping[str, Any]) -> str:
     match_type = _normalize_text(run.get("expected_event_match_type"))
     retrieval_mode = _normalize_text(run.get("expected_retrieval_mode"))
 
-    if match_type in {"exact", "alias"}:
+    if match_type in {"exact", "alias", "trusted_exact"}:
         return "exact_grounding_required"
     if retrieval_mode == "exact_only":
         return "exact_grounding_required"
@@ -317,43 +318,7 @@ def _scenario_terms(value: Any) -> list[str]:
 
 def _failure_kind(error: str | Mapping[str, Any] | None) -> str | None:
     """Classify a failed eval row by the source of the failure."""
-    if not error:
-        return None
-
-    if isinstance(error, Mapping):
-        error_type = _normalize_text(error.get("error_type"))
-        failure_stage = _normalize_text(error.get("failure_stage"))
-        message = _normalize_text(error.get("message"))
-        schema_errors = error.get("schema_errors")
-
-        if error_type in {"output_schema_failure", "schema_validation"}:
-            return "output_schema_failure"
-        if failure_stage in {"writer_output_validation", "output_schema_validation", "writer_repair_pass"}:
-            return "output_schema_failure"
-        if isinstance(schema_errors, list) and schema_errors:
-            return "output_schema_failure"
-
-        normalized = " ".join(part for part in [error_type, failure_stage, message] if part)
-        if (
-            "validationerror" in normalized
-            or "unexpectedmodelbehavior" in normalized
-            or "output validation" in normalized
-            or "schema" in normalized
-            or "setuprecommendation" in normalized
-        ):
-            return "output_schema_failure"
-        return "runtime_failure"
-
-    normalized = str(error).lower()
-    if (
-        "validationerror" in normalized
-        or "unexpectedmodelbehavior" in normalized
-        or "output validation" in normalized
-        or "schema" in normalized
-        or "setuprecommendation" in normalized
-    ):
-        return "output_schema_failure"
-    return "runtime_failure"
+    return classify_failure_kind(error)
 
 
 def _fallback_honesty_issues(
@@ -531,7 +496,7 @@ def evaluate_event_alignment_assertions(run: dict[str, Any]) -> dict[str, Any]:
             issues.append("expected_exact_event_but_no_exact_hits")
         if retrieval_source == "similar_event":
             issues.append("expected_exact_event_but_used_similar_event")
-        if event_match_type == "exact" and exact_event_hit_count in {0, None}:
+        if event_match_type in {"exact", "trusted_exact"} and exact_event_hit_count in {0, None}:
             issues.append("event_match_type_exact_but_zero_exact_hits")
         if expected_event and matched_event and expected_event != matched_event:
             issues.append("matched_event_differs_from_expected_event")
