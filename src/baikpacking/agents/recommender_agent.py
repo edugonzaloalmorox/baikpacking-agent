@@ -32,6 +32,12 @@ from baikpacking.agents.event_context_resolution import (
     infer_event_archetype as _infer_event_archetype_impl,
 )
 from baikpacking.agents.models import SetupCore, SetupRecommendation, WriterRecommendationDraft
+from baikpacking.agents.guardrails import (
+    GuardDecision,
+    RecommendationGuardBlocked,
+    guard_trace_payload,
+    should_recommend,
+)
 from baikpacking.agents.output_validation import _fill_requested_component_from_riders
 from baikpacking.agents.postprocess import (
     _infer_event_from_riders as _postprocess_infer_event_from_riders,
@@ -441,6 +447,17 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
             elapsed_ms=0.0,
         )
 
+        guard_decision = should_recommend(user_query, event_resolution, intent)
+        record_trace_call(
+            deps=deps,
+            tool_name="guard_decision",
+            args={"user_query": user_query},
+            result=guard_trace_payload(guard_decision, user_query),
+            elapsed_ms=0.0,
+        )
+        if not guard_decision.allow_recommendation:
+            raise RecommendationGuardBlocked(guard_decision, trace=trace)
+
         event_context_summary = time_and_record(
             deps=deps,
             tool_name="event_web_search",
@@ -458,6 +475,7 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
             event_context_summary=event_context_summary,
             intent=intent,
             user_query=user_query,
+            allow_exact_grounding=guard_decision.allow_exact_grounding,
         )
 
         record_trace_call(
@@ -633,6 +651,7 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
             retrieval_source=retrieval_result.retrieval_source,
             exact_event_hit_count=retrieval_result.exact_event_hit_count,
             evidence_strength=evidence_summary.evidence_strength,
+            allow_exact_grounding=guard_decision.allow_exact_grounding,
         )
 
         record_trace_call(
