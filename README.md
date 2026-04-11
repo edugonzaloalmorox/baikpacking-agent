@@ -354,20 +354,6 @@ make kb-status
 
 If `LOGFIRE_TOKEN` is configured, inspect traces in Logfire. Otherwise tracing remains local.
 
-## Current Status
-
-What is working well:
-
-- the KB build path is real and reproducible
-- the writer/output contract is small and stable
-- the eval runner produces structured JSONL artifacts
-- the dashboard supports manual inspection and reviewer feedback
-
-What is still being improved:
-
-- exact-event vs similar-event alignment in thinly covered events
-- scenario calibration for strict event-alignment cases
-- broader KB coverage for events that are not well represented in the source data
 
 ## Notes For Reviewers
 

@@ -253,3 +253,42 @@ def test_recommender_injects_review_context_into_writer_prompt(monkeypatch):
     assert prompt_holder["prompt"] is not None
     assert "Human review hints:" in prompt_holder["prompt"]
     assert "corrected_policy_mode=strict_grounded" in prompt_holder["prompt"]
+
+
+def test_recommender_emits_progress_updates_in_stage_order(monkeypatch):
+    from baikpacking.agents import recommender_agent as mod
+
+    writer_output = SetupRecommendation(
+        summary="Grounded summary",
+        reasoning="Grounded reasoning",
+        recommended_setup=SetupCore(),
+        similar_riders=[],
+    )
+
+    def writer_run_sync(_prompt):
+        return SimpleNamespace(output=writer_output)
+
+    _patch_runtime(monkeypatch, mod, writer_run_sync)
+
+    events = []
+
+    def progress_callback(event):
+        events.append(event.model_dump(mode="json"))
+
+    rec, trace = mod.recommend_setup_with_trace("Give me tyres for Pirenaica", progress_callback=progress_callback)
+
+    assert isinstance(rec, SetupRecommendation)
+    assert [item["stage_key"] for item in events] == [
+        "resolving_event",
+        "classifying_intent",
+        "searching_riders",
+        "selecting_policy",
+        "writing_recommendation",
+    ]
+    assert [item["stage_label"] for item in events] == [
+        "Resolving event",
+        "Classifying intent",
+        "Searching riders",
+        "Selecting policy",
+        "Writing recommendation",
+    ]
