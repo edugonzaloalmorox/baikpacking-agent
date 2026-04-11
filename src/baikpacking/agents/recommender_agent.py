@@ -39,6 +39,7 @@ from baikpacking.agents.guardrails import (
     should_recommend,
 )
 from baikpacking.agents.output_validation import _fill_requested_component_from_riders
+from baikpacking.agents.progress import ProgressCallback, emit_progress
 from baikpacking.agents.postprocess import (
     _infer_event_from_riders as _postprocess_infer_event_from_riders,
     _infer_year_from_title,
@@ -422,13 +423,23 @@ def _build_deps(call_trace: Optional[CallTrace] = None) -> PgVectorSearchDeps:
     )
 
 
-def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, CallTrace]:
+def recommend_setup_with_trace(
+    user_query: str,
+    progress_callback: ProgressCallback | None = None,
+) -> Tuple[SetupRecommendation, CallTrace]:
     with logfire.span("recommender.run", user_query=user_query):
         trace = CallTrace()
         deps = _build_deps(call_trace=trace)
 
+        emit_progress(progress_callback, "resolving_event", "Resolving event")
         event_resolution = resolve_event(user_query)
         event_name = event_resolution.display_name
+        emit_progress(
+            progress_callback,
+            "classifying_intent",
+            "Classifying intent",
+            details={"event": event_name},
+        )
         intent = _classify_query_intent(user_query)
 
         record_trace_call(
@@ -458,6 +469,12 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
         if not guard_decision.allow_recommendation:
             raise RecommendationGuardBlocked(guard_decision, trace=trace)
 
+        emit_progress(
+            progress_callback,
+            "searching_riders",
+            "Searching riders",
+            details={"event": event_name, "component": intent.component},
+        )
         event_context_summary = time_and_record(
             deps=deps,
             tool_name="event_web_search",
@@ -654,6 +671,15 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
             allow_exact_grounding=guard_decision.allow_exact_grounding,
         )
 
+        emit_progress(
+            progress_callback,
+            "selecting_policy",
+            "Selecting policy",
+            details={
+                "retrieval_source": retrieval_result.retrieval_source,
+                "evidence_strength": evidence_summary.evidence_strength,
+            },
+        )
         record_trace_call(
             deps=deps,
             tool_name="evidence_summary",
@@ -719,6 +745,12 @@ def recommend_setup_with_trace(user_query: str) -> Tuple[SetupRecommendation, Ca
 
         writer_input_json = writer_input.model_dump_json(indent=2)
         writer_prompt = _build_writer_prompt(writer_input_json, review_feedback_context or None)
+        emit_progress(
+            progress_callback,
+            "writing_recommendation",
+            "Writing recommendation",
+            details={"event": event_name, "component": intent.component},
+        )
         writer_call_count = 0
         writer_total_ms = 0.0
         writer_first_pass_ok = False

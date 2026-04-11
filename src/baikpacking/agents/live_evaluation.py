@@ -430,6 +430,7 @@ def _retrieval_policy_issues(
 
 def build_live_run_record(
     *,
+    run_id: str | None = None,
     query: str,
     status: str,
     error: str | Mapping[str, Any] | None,
@@ -439,6 +440,7 @@ def build_live_run_record(
     request_meta: Mapping[str, Any] | None = None,
 ) -> LiveRunRecord:
     """Build a deterministic live-eval record from a real recommendation run."""
+    record_run_id = run_id or uuid.uuid4().hex
     response = response or {}
     request_meta = dict(request_meta or {})
     recommendation = response.get("recommendation") if isinstance(response, Mapping) else {}
@@ -482,7 +484,7 @@ def build_live_run_record(
 
     if status == "skipped":
         return LiveRunRecord(
-            run_id=uuid.uuid4().hex,
+            run_id=record_run_id,
             timestamp=datetime.now(timezone.utc).isoformat(),
             query=query,
             status=status,
@@ -555,7 +557,7 @@ def build_live_run_record(
     failure_kind = classify_failure_kind(error) if status == "failure" else None
 
     return LiveRunRecord(
-        run_id=uuid.uuid4().hex,
+        run_id=record_run_id,
         timestamp=datetime.now(timezone.utc).isoformat(),
         query=query,
         status=status,
