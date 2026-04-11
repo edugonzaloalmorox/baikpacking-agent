@@ -1,5 +1,7 @@
 # 🚵‍♂️ bAIpacking Agent
 
+Capstone project for the [AI Engineering Buildcamp: From RAG to Agents](https://maven.com/alexey-grigorev/from-rag-to-agents)
+
 ## The problem
 
 Bikepacking setup advice is scattered across race articles, rider interviews, and equipment lists. A reviewer or rider usually wants a fast answer to questions like:
@@ -25,7 +27,9 @@ This system turns that unstructured material into a searchable knowledge base an
 
 ### Knowledge Base
 
-The active knowledge base is stored in PostgreSQL and built from DotWatcher bikepacking articles and related event context.
+The active knowledge base is stored in PostgreSQL and built from [DotWatcher bikepacking set ups](https://dotwatcher.cc/features) and related event contexts
+
+![alt text](docs/bike.png)
 
 Relevant pieces include:
 
@@ -39,7 +43,7 @@ The main runtime retrieval path uses:
 - `riders`
 - `rider_chunks`
 - `articles`
-- pgvector-backed similarity search
+-  `similarity search` between bikes and key items
 
 ### Retrieval Strategy
 
@@ -381,3 +385,5 @@ If `LOGFIRE_TOKEN` is configured, inspect traces in Logfire. Otherwise tracing r
 - Inspect eval output: `data/eval/scenario_runs.jsonl`
 - Inspect reviewer feedback: `data/eval/scenario_reviews.jsonl`
 - Inspect runtime smoke logs: `data/eval/sample_eval_rows.jsonl`
+
+Any questions or comments please reach out: eduardogonzaloalmorox@gmail.com
