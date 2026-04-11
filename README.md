@@ -1,4 +1,4 @@
-# bAIpacking Agent
+# 🚵‍♂️ bAIpacking Agent
 
 ## The problem
 
@@ -9,6 +9,17 @@ Bikepacking setup advice is scattered across race articles, rider interviews, an
 - What do similar riders actually use when exact event evidence is limited?
 
 This system turns that unstructured material into a searchable knowledge base and a grounded recommendation pipeline.
+
+
+![alt text](docs/front_page.png)
+
+## How the system is organised
+
+
+- The serving path ends at `Recommendation` and returns through the API
+- `Data Eval`, `human feedback`, and `LLM Judge` are evaluation artifacts, not part of the live request path
+
+![alt text](docs/architecture.png)
 
 ## Knowledge Base And Retrieval
 
@@ -50,42 +61,49 @@ The recommender also tracks policy modes to set the "tone" of the recommendation
 
 Those policy modes control how much event-specific language and specificity the writer may use.
 
-### Known Limitations
-
-- Some events are not present in the KB.
-- Some exact-event pages have sparse rider coverage, so the system can still fall back to similar events.
-- Retrieval is deterministic, but exact vs similar coverage is still an active area of calibration.
 
 ## Agents And LLM
 
-The runtime recommender is centered on `src/baikpacking/agents/recommender_agent.py` and the supporting modules under `src/baikpacking/agents/`.
+The recommender is centered on `src/baikpacking/agents/recommender_agent.py` and the supporting modules under `src/baikpacking/agents/`.
 
-Current runtime flow:
+The online request path is:
 
-1. event resolution
-2. query intent classification
-3. event web context lookup
-4. retrieval planning
-5. rider search
-6. evidence summarization
-7. policy selection
-8. writer draft generation
-9. deterministic postprocessing and validation
+1. `POST /recommend` or the local CLI entrypoint
+2. event resolution
+3. query intent classification
+4. guardrail check
+5. event web context lookup
+6. retrieval planning
+7. similar-rider search in PostgreSQL / pgvector
+8. evidence summarization
+9. policy selection
+10. optional review-hint lookup
+11. writer draft generation
+12. validation, optional repair, and postprocessing
 
 The architecture is intentionally small:
 
 - `event_resolution.py` resolves aliases and canonical event names
-- `event_context_resolution.py` fetches event-level context
-- `retrieval_planning.py` decides the retrieval query shape
-- `tools/riders.py` does the actual rider retrieval
+- `event_context_resolution.py` fetches event-level context from the web and derives event-family hints
+- `retrieval_planning.py` builds the exact-vs-similar retrieval query plan
+- `tools/riders.py` runs the actual rider retrieval against Postgres / pgvector
 - `evidence_summary.py` summarizes evidence strength
 - `policy.py` selects `strict_grounded`, `pattern_based`, or `generic_fallback`
+- `review_feedback.py` loads optional scenario-review hints from `data/eval/scenario_reviews.jsonl`
 - `writer_input.py` defines the writer-facing input contract
-- `models.py` defines the minimal `WriterRecommendationDraft`
-- `review_feedback.py` loads optional human review hints
+- `models.py` defines `WriterRecommendationDraft` and the final `SetupRecommendation`
 - `postprocess.py` and `output_validation.py` assemble and validate the final output
 
 The writer stage does not own the full final recommendation object. It produces a compact draft, and code assembles the final `SetupRecommendation`.
+
+
+### Runtime And Eval Separation
+
+The live API writes append-only telemetry to `data/eval/live_runs.jsonl` on every request, and the `/feedback` endpoint appends user feedback to `data/eval/live_feedback.jsonl`.
+
+That data is then consumed by the offline judge in `src/baikpacking/eval/output_judge.py`, which reads live runs and feedback and writes judgments to `data/eval/output_judgments.jsonl`.
+
+So the judge and feedback files are evaluation artifacts, not part of the serving-time recommendation loop.
 
 ## Repository Structure
 
@@ -355,9 +373,9 @@ make kb-status
 If `LOGFIRE_TOKEN` is configured, inspect traces in Logfire. Otherwise tracing remains local.
 
 
-## Notes For Reviewers
+## Want to review the system? 
 
-- Run the app: `uv run python -m baikpacking.scripts.run_recommender`
+- Run the recommender: `uv run python -m baikpacking.scripts.run_recommender`
 - Run eval: `uv run python -m baikpacking.scripts.run_eval_scenarios`
 - Open the dashboard: `uv run streamlit run src/baikpacking/apps/eval_dashboard.py`
 - Inspect eval output: `data/eval/scenario_runs.jsonl`
