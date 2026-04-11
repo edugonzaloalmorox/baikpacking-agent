@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+from functools import partial
 import logging
 import time
+import uuid
 from typing import Any, Mapping, Optional
-
-import anyio
 
 from baikpacking.agents.models import QueryIntent
 from baikpacking.agents.guardrails import RecommendationGuardBlocked
 from baikpacking.agents.live_evaluation import append_live_run, build_live_run_record
+from baikpacking.agents.live_feedback import append_live_feedback, build_live_feedback_record
+from baikpacking.agents.progress import ProgressCallback
 from baikpacking.agents.orchestration_models import (
     EvidenceSummary,
     EventResolutionResult,
@@ -19,6 +21,8 @@ from baikpacking.agents.orchestration_models import (
 )
 from baikpacking.agents.recommender_agent import recommend_setup_with_trace
 from baikpacking.api.schemas import (
+    FeedbackRequest,
+    FeedbackResponse,
     HealthResponse,
     RecommendationDebug,
     RecommendRequest,
@@ -128,11 +132,23 @@ class RecommendationService:
         *,
         request_meta: Mapping[str, Any] | None = None,
     ) -> RecommendResponse:
+        import anyio
+
+        return await anyio.to_thread.run_sync(partial(self.recommend_sync, request, request_meta=request_meta))
+
+    def recommend_sync(
+        self,
+        request: RecommendRequest,
+        *,
+        request_meta: Mapping[str, Any] | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> RecommendResponse:
         query = request.query.strip()
         status = "success"
         error_text: str | None = None
         response_payload: dict[str, Any] | None = None
         trace: Any = None
+        run_id = uuid.uuid4().hex
         started = time.perf_counter()
 
         try:
@@ -144,7 +160,12 @@ class RecommendationService:
             logger.info("recommend_request query=%r include_debug=%s", query, request.include_debug)
 
             try:
-                recommendation, trace = await anyio.to_thread.run_sync(recommend_setup_with_trace, query)
+                try:
+                    recommendation, trace = recommend_setup_with_trace(query, progress_callback=progress_callback)
+                except TypeError as exc:
+                    if "unexpected keyword argument 'progress_callback'" not in str(exc):
+                        raise
+                    recommendation, trace = recommend_setup_with_trace(query)
             except RecommendationGuardBlocked as exc:
                 logger.info(
                     "recommendation skipped for query=%r guard_type=%s",
@@ -154,6 +175,7 @@ class RecommendationService:
                 status = "skipped"
                 trace = exc.trace
                 response = RecommendResponse(
+                    run_id=run_id,
                     query=query,
                     status="skipped",
                     message=exc.decision.user_message or exc.decision.reason,
@@ -179,6 +201,7 @@ class RecommendationService:
 
             debug = _build_debug(trace) if request.include_debug else None
             response = RecommendResponse(
+                run_id=run_id,
                 query=query,
                 resolved_event=event_resolution,
                 intent=intent,
@@ -192,7 +215,8 @@ class RecommendationService:
             return response
         finally:
             latency_ms = (time.perf_counter() - started) * 1000.0
-            await self._write_live_eval(
+            self._write_live_eval(
+                run_id=run_id,
                 query=query,
                 status=status,
                 error_text=error_text,
@@ -202,9 +226,10 @@ class RecommendationService:
                 request_meta=request_meta,
             )
 
-    async def _write_live_eval(
+    def _write_live_eval(
         self,
         *,
+        run_id: str,
         query: str,
         status: str,
         error_text: str | None,
@@ -214,6 +239,7 @@ class RecommendationService:
         request_meta: Mapping[str, Any] | None = None,
     ) -> None:
         record = build_live_run_record(
+            run_id=run_id,
             query=query,
             status=status,
             error=error_text,
@@ -223,9 +249,47 @@ class RecommendationService:
             request_meta=request_meta,
         )
         try:
-            await anyio.to_thread.run_sync(append_live_run, record)
+            append_live_run(record)
         except Exception:
             logger.exception("failed to persist live eval row")
+
+    async def submit_feedback(
+        self,
+        request: FeedbackRequest,
+        *,
+        request_meta: Mapping[str, Any] | None = None,
+    ) -> FeedbackResponse:
+        import anyio
+
+        return await anyio.to_thread.run_sync(partial(self.submit_feedback_sync, request, request_meta=request_meta))
+
+    def submit_feedback_sync(
+        self,
+        request: FeedbackRequest,
+        *,
+        request_meta: Mapping[str, Any] | None = None,
+    ) -> FeedbackResponse:
+        run_id = request.run_id.strip()
+        if not run_id:
+            raise ApiServiceError("run_id must not be empty", status_code=400)
+
+        record = build_live_feedback_record(
+            run_id=run_id,
+            feedback=request.feedback,
+            comment=request.comment,
+            request_meta=request_meta,
+        )
+        try:
+            append_live_feedback(record)
+        except Exception:
+            logger.exception("failed to persist live feedback row")
+            raise ApiServiceError("failed to persist feedback", status_code=503) from None
+
+        return FeedbackResponse(
+            run_id=record.run_id,
+            feedback=record.feedback,
+            timestamp=record.timestamp,
+        )
 
 
 _SERVICE = RecommendationService()

@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from baikpacking.agents.models import QueryIntent, SetupRecommendation
 from baikpacking.agents.guardrails import GuardDecision
+from baikpacking.agents.progress import RecommendationProgress
 from baikpacking.agents.orchestration_models import (
     EvidenceSummary,
     EventResolutionResult,
@@ -28,6 +29,21 @@ class RecommendRequest(BaseModel):
     )
 
 
+class FeedbackRequest(BaseModel):
+    """Request body for POST /feedback."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    run_id: str = Field(min_length=1, description="Live run identifier returned by /recommend.")
+    feedback: Literal["thumbs_up", "thumbs_down"] = Field(
+        description="User sentiment for the recommendation.",
+    )
+    comment: Optional[str] = Field(
+        default=None,
+        description="Optional free-text note, typically provided for thumbs-down feedback.",
+    )
+
+
 class TraceEventSchema(BaseModel):
     """Serializable trace event exposed by the API when debug is requested."""
 
@@ -44,9 +60,20 @@ class RecommendationDebug(BaseModel):
     trace: list[TraceEventSchema] = Field(default_factory=list)
 
 
+class RecommendationStreamEvent(BaseModel):
+    """One streamed event emitted by the recommendation progress endpoint."""
+
+    kind: Literal["progress", "final", "error"]
+    progress: Optional[RecommendationProgress] = None
+    response: Optional[dict[str, Any]] = None
+    error: Optional[str] = None
+    status_code: Optional[int] = None
+
+
 class RecommendResponse(BaseModel):
     """Structured recommendation response."""
 
+    run_id: str
     query: str
     status: Literal["success", "skipped"] = "success"
     message: Optional[str] = None
@@ -57,6 +84,15 @@ class RecommendResponse(BaseModel):
     evidence: Optional[EvidenceSummary] = None
     policy: Optional[RecommendationPolicy] = None
     debug: Optional[RecommendationDebug] = None
+
+
+class FeedbackResponse(BaseModel):
+    """Structured response for a stored feedback event."""
+
+    run_id: str
+    feedback: Literal["thumbs_up", "thumbs_down"]
+    timestamp: str
+    status: Literal["recorded"] = "recorded"
 
 
 class ReadyResponse(BaseModel):

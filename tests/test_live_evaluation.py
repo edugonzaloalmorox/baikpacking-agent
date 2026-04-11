@@ -314,6 +314,7 @@ def test_api_service_persists_live_eval_row(tmp_path: Path, monkeypatch: pytest.
         )
     )
 
+    assert response.run_id
     assert response.recommendation.summary == "Use a grounded tyre setup."
 
     live_path = tmp_path / "live_runs.jsonl"
@@ -321,6 +322,7 @@ def test_api_service_persists_live_eval_row(tmp_path: Path, monkeypatch: pytest.
     rows = [json.loads(line) for line in live_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(rows) == 1
     row = rows[0]
+    assert row["run_id"] == response.run_id
     assert row["query"] == "What tyres do you recommend for Atlas Mountain Race?"
     assert row["retrieval_source"] == "exact_event"
     assert row["retrieval_mode"] == "exact_only"
