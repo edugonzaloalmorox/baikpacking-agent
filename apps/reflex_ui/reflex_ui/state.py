@@ -1,5 +1,6 @@
 """Application state for the bikepacking chat UI."""
 
+import asyncio
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ class ChatTurn(BaseModel):
     role: Literal["user", "assistant", "error"]
     content: str
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    run_id: str = ""
     resolved_event_name: str = ""
     resolved_event_match_type: str = ""
     resolved_event_chip_label: str = ""
@@ -50,6 +52,10 @@ class ChatTurn(BaseModel):
     retrieval_plan_json: str = ""
     trace_json: str = ""
     has_debug: bool = False
+    feedback_status: str = ""
+    feedback_comment: str = ""
+    feedback_form_open: bool = False
+    feedback_error: str = ""
     error: str = ""
 
 
@@ -176,6 +182,7 @@ def _build_assistant_turn(response: dict[str, Any]) -> ChatTurn:
         id=uuid.uuid4().hex,
         role="assistant",
         content=_build_assistant_text(response),
+        run_id=_first_non_empty(_safe_get(response, "run_id")),
         resolved_event_name=_first_non_empty(resolved_event.get("display_name")),
         resolved_event_match_type=_first_non_empty(resolved_event.get("match_type")),
         resolved_event_chip_label=_first_non_empty(resolved_event.get("display_name"), "Grounded answer"),
@@ -221,6 +228,9 @@ class BikepackingState(rx.State):
     messages: list[ChatTurn] = []
     include_debug: bool = True
     api_base_url: str = _normalize_base_url(os.getenv("API_BASE_URL"))
+    loading_stage_key: str = ""
+    loading_stage_label: str = ""
+    loading_stage_history: list[dict[str, Any]] = []
 
     def set_query(self, value: str) -> None:
         """Update the composer text."""
@@ -234,6 +244,114 @@ class BikepackingState(rx.State):
     def clear_error(self) -> None:
         """Clear any visible local error state."""
         self.error = ""
+
+    def _reset_loading_progress(self) -> None:
+        """Clear transient loading-stage state."""
+        self.loading_stage_key = ""
+        self.loading_stage_label = ""
+        self.loading_stage_history = []
+
+    def _set_loading_stage(self, stage: dict[str, Any]) -> None:
+        """Record the current recommendation stage."""
+        stage_key = str(stage.get("stage_key") or "")
+        stage_label = str(stage.get("stage_label") or "")
+        if not stage_key or not stage_label:
+            return
+
+        current = {
+            "stage_key": stage_key,
+            "stage_label": stage_label,
+            "timestamp": stage.get("timestamp"),
+            "details": stage.get("details") or {},
+        }
+
+        history = list(self.loading_stage_history or [])
+
+        if history:
+            last = history[-1]
+            if last.get("stage_key") == stage_key and last.get("stage_label") == stage_label:
+                self.loading_stage_key = stage_key
+                self.loading_stage_label = stage_label
+                return
+
+        history.append(current)
+        self.loading_stage_history = history
+        self.loading_stage_key = stage_key
+        self.loading_stage_label = stage_label
+
+    def _update_turn(self, run_id: str, **updates: Any) -> None:
+        """Update one assistant turn in place by run id."""
+        for index, turn in enumerate(self.messages):
+            if turn.role == "assistant" and turn.run_id == run_id:
+                self.messages[index] = turn.model_copy(update=updates)
+                return
+
+    def open_feedback_form(self, run_id: str) -> None:
+        """Reveal the thumbs-down comment form for a turn."""
+        self._update_turn(run_id, feedback_form_open=True, feedback_error="")
+
+    def set_feedback_comment(self, run_id: str, value: str) -> None:
+        """Update the in-progress feedback comment for a turn."""
+        self._update_turn(run_id, feedback_comment=value)
+
+    async def submit_feedback(self, run_id: str, feedback: str) -> None:
+        """Send user feedback for a prior recommendation."""
+        run_id = (run_id or "").strip()
+        if not run_id:
+            async with self:
+                self.error = "Missing run id for feedback submission."
+            return
+
+        target_turn = None
+        for turn in reversed(self.messages):
+            if turn.role == "assistant" and turn.run_id == run_id:
+                target_turn = turn
+                break
+
+        if target_turn is None:
+            async with self:
+                self.error = "Could not find the assistant turn for that feedback."
+            return
+
+        comment = target_turn.feedback_comment.strip() if target_turn.feedback_comment else ""
+        payload: dict[str, Any] = {"run_id": run_id, "feedback": feedback}
+        if comment:
+            payload["comment"] = comment
+
+        url = f"{self.api_base_url}/feedback"
+        try:
+            timeout = httpx.Timeout(30.0, connect=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(url, json=payload)
+
+            if resp.status_code >= 400:
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = resp.text
+                raise RuntimeError(_extract_api_error(body, f"HTTP {resp.status_code} from feedback API"))
+
+            data = resp.json()
+            if not isinstance(data, dict):
+                raise RuntimeError("Unexpected feedback response shape.")
+
+            async with self:
+                self._update_turn(
+                    run_id,
+                    feedback_status=str(data.get("feedback") or feedback),
+                    feedback_form_open=False,
+                    feedback_error="",
+                )
+        except httpx.RequestError as exc:
+            logger.exception("bikepacking_ui_feedback_request_error")
+            async with self:
+                self._update_turn(run_id, feedback_error="Could not reach the feedback service.")
+                self.error = str(exc)
+        except Exception as exc:
+            logger.exception("bikepacking_ui_feedback_error")
+            async with self:
+                self._update_turn(run_id, feedback_error="Could not record that feedback right now.")
+                self.error = str(exc)
 
     @rx.var
     def can_send(self) -> bool:
@@ -253,12 +371,14 @@ class BikepackingState(rx.State):
             if turn.role == "assistant" and turn.trace_json:
                 return turn.trace_json
         return ""
-
+    
+    @rx.event(background=True)
     async def submit_query(self) -> None:
         """Send the current prompt to the FastAPI recommender."""
         query = (self.query or "").strip()
         if not query:
-            self.error = "Enter a bikepacking question before sending it."
+            async with self:
+                self.error = "Enter a bikepacking question before sending it."
             return
 
         user_turn = ChatTurn(
@@ -266,43 +386,121 @@ class BikepackingState(rx.State):
             role="user",
             content=query,
         )
-        self.messages.append(user_turn)
-        self.query = ""
-        self.error = ""
-        self.loading = True
 
-        url = f"{self.api_base_url}/recommend"
+        async with self:
+            self.messages.append(user_turn)
+            self.query = ""
+            self.error = ""
+            self.loading = True
+            self._reset_loading_progress()
+            self.loading_stage_key = "starting"
+            self.loading_stage_label = "Starting recommendation"
+
+        stream_url = f"{self.api_base_url}/recommend/stream"
+        fallback_url = f"{self.api_base_url}/recommend"
         payload = {"query": query, "include_debug": self.include_debug}
 
         try:
-            timeout = httpx.Timeout(90.0, connect=10.0)
+            timeout = httpx.Timeout(90.0, connect=10.0, read=None)
             async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(url, json=payload)
+                async with client.stream("POST", stream_url, json=payload) as resp:
+                    if resp.status_code >= 400:
+                        raise httpx.RequestError(
+                            f"HTTP {resp.status_code} from recommendation stream",
+                            request=resp.request,
+                        )
 
-            if resp.status_code >= 400:
-                try:
-                    body = resp.json()
-                except Exception:
-                    body = resp.text
-                raise RuntimeError(_extract_api_error(body, f"HTTP {resp.status_code} from recommender API"))
+                    final_response: dict[str, Any] | None = None
+                    saw_progress = False
 
-            data = resp.json()
-            if not isinstance(data, dict):
-                raise RuntimeError("Unexpected API response shape.")
+                    async for line in resp.aiter_lines():
+                        line = line.strip()
+                        if not line:
+                            continue
 
-            self.messages.append(_build_assistant_turn(data))
+                        try:
+                            event = json.loads(line)
+                        except Exception:
+                            continue
+
+                        if not isinstance(event, dict):
+                            continue
+
+                        kind = str(event.get("kind") or "")
+
+                        if kind == "progress":
+                            progress = event.get("progress")
+                            if isinstance(progress, dict):
+                                saw_progress = True
+                                async with self:
+                                    self._set_loading_stage(progress)
+                                await asyncio.sleep(0)
+                            continue
+
+                        if kind == "final":
+                            response = event.get("response")
+                            if isinstance(response, dict):
+                                final_response = response
+                            break
+
+                        if kind == "error":
+                            raise RuntimeError(_extract_api_error(event, "Recommendation stream failed."))
+
+                    if final_response is None:
+                        if not saw_progress:
+                            raise httpx.RequestError(
+                                "Recommendation stream ended without a final response.",
+                                request=resp.request,
+                            )
+                        raise RuntimeError("Recommendation stream ended without a final response.")
+
+                    assistant_turn = _build_assistant_turn(final_response)
+                    async with self:
+                        self.messages.append(assistant_turn)
+
         except httpx.RequestError as exc:
             logger.exception("bikepacking_ui_request_error")
-            message = (
-                f"I couldn’t reach the recommendation service at {self.api_base_url}. "
-                "Please try again in a moment."
-            )
-            self.messages.append(_build_error_turn(message))
-            self.error = str(exc)
+            try:
+                timeout = httpx.Timeout(90.0, connect=10.0)
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(fallback_url, json=payload)
+
+                if resp.status_code >= 400:
+                    try:
+                        body = resp.json()
+                    except Exception:
+                        body = resp.text
+                    raise RuntimeError(_extract_api_error(body, f"HTTP {resp.status_code} from recommender API"))
+
+                data = resp.json()
+                if not isinstance(data, dict):
+                    raise RuntimeError("Unexpected API response shape.")
+
+                assistant_turn = _build_assistant_turn(data)
+                async with self:
+                    self.messages.append(assistant_turn)
+
+            except Exception:
+                message = (
+                    f"I couldn’t reach the recommendation service at {self.api_base_url}. "
+                    "Please try again in a moment."
+                )
+                async with self:
+                    self.messages.append(_build_error_turn(message))
+                    self.error = str(exc)
+
+            finally:
+                async with self:
+                    self._reset_loading_progress()
+
         except Exception as exc:
             logger.exception("bikepacking_ui_recommend_error")
             message = "I hit a problem generating that recommendation. Please try again."
-            self.messages.append(_build_error_turn(message))
-            self.error = str(exc)
+            async with self:
+                self.messages.append(_build_error_turn(message))
+                self.error = str(exc)
+
         finally:
-            self.loading = False
+            async with self:
+                self.loading = False
+                #self._reset_loading_progress()
