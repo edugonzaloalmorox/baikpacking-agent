@@ -334,7 +334,7 @@ ui: check-env
 	@echo "    Frontend: http://localhost:$(REFLEX_FRONTEND_PORT)"
 	@echo "    Reflex backend: http://localhost:$(REFLEX_BACKEND_PORT)"
 	@echo "    API_BASE_URL=$(API_BASE_URL)"
-	@cd apps/reflex_ui && API_BASE_URL=$(API_BASE_URL) reflex run
+	@cd apps/reflex_ui && API_BASE_URL=$(API_BASE_URL) $(UV) reflex run
 
 app: check-env
 	@echo ""
@@ -344,7 +344,7 @@ app: check-env
 	@echo "    Reflex backend: http://localhost:$(REFLEX_BACKEND_PORT)"
 	@trap 'kill 0' INT TERM EXIT; \
 	($(UV) uvicorn src.baikpacking.api.main:app --reload --port $(API_PORT)) & \
-	(cd apps/reflex_ui && API_BASE_URL=$(API_BASE_URL) reflex run) & \
+	(cd apps/reflex_ui && API_BASE_URL=$(API_BASE_URL) $(UV) reflex run) & \
 	wait
 
 stop-app:
