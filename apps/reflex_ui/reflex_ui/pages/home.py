@@ -506,7 +506,7 @@ def home() -> rx.Component:
                 rx.box(_composer(), flex_shrink="0"),
                 rx.box(
                     rx.text(
-                        "Grounded recommendations powered by the bikepacking backend.",
+                        "This is an early prototype. Please provide feedback to help us improve the system!",
                         font_size="12px",
                         color="#64748b",
                         text_align="center",
