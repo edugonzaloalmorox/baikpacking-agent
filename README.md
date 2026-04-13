@@ -315,7 +315,6 @@ The current deterministic checks cover:
 - schema/runtime stability
 - failure classification such as `output_schema_failure`
 
-There is no LLM judge in this flow.
 
 ### Eval Dashboard
 
@@ -354,6 +353,8 @@ Each review can include:
 - `review_notes`
 
 The recommender loads matching review hints at runtime for the same event/component combination and uses them as prompt context. Reviews are not treated as hard labels or a learned model.
+
+There is a LLM judge that evaluates the quality of the answer offline. It uses data/eval/live_runs.jsonl
 
 ## Monitoring And Tracing
 
