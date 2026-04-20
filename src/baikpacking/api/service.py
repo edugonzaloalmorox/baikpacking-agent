@@ -1,12 +1,11 @@
 """Service layer for the bikepacking HTTP API."""
 
-from __future__ import annotations
-
 from functools import partial
 import logging
 import time
 import uuid
 from typing import Any, Mapping, Optional
+import anyio
 
 from baikpacking.agents.models import QueryIntent
 from baikpacking.agents.guardrails import RecommendationGuardBlocked

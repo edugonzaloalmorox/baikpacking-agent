@@ -1,7 +1,4 @@
 """Pydantic schemas for the bikepacking HTTP API."""
-
-from __future__ import annotations
-
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
