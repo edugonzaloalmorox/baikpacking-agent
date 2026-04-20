@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 DEFAULT_QUERY = "What tyres do you recommend for Atlas Mountain Race?"
-DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
+DEFAULT_API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8001")
 EXAMPLE_PROMPTS = [
     "What tyres do you recommend for Atlas Mountain Race?",
     "Recommend me a setup for Tour Divide",

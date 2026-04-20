@@ -1,12 +1,10 @@
 """API routes for the bikepacking recommender."""
-
-from __future__ import annotations
-
 import json
 import threading
 from queue import Queue
+from anyio import to_thread
 
-import anyio
+
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 

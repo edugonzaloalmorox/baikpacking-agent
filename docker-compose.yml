@@ -10,11 +10,77 @@ services:
       - "5433:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
+      - ./backups:/backups
+      - ./docker/init:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U baikpacking -d baikpacking"]
       interval: 5s
       timeout: 5s
       retries: 20
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: baikpacking-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    container_name: baikpacking-api
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://baikpacking:baikpacking@postgres:5432/baikpacking
+      EMB_OLLAMA_BASE_URL: http://ollama:11434
+      EMB_EMBEDDING_MODEL: mxbai-embed-large:335m
+    ports:
+      - "8001:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+  ui:
+    build:
+      context: .
+      dockerfile: docker/ui.Dockerfile
+    container_name: baikpacking-ui
+    env_file:
+      - .env
+    environment:
+      API_BASE_URL: http://api:8000
+      REFLEX_API_URL: http://0.0.0.0:8000
+    ports:
+      - "3000:3000"
+      - "8000:8000"
+    depends_on:
+      api:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000 > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
 
 volumes:
   pg_data:
+  ollama_data:

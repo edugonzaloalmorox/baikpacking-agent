@@ -7,17 +7,12 @@ import requests
 
 from .config import Settings
 
-import requests
-
-from .config import Settings
-
 settings = Settings()
 _TIMEOUT_S = 30
 
 
 def _ollama_embeddings_url() -> str:
-    ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-    return f"{ollama_host.rstrip('/')}/api/embeddings"
+    return f"{settings.ollama_base_url.rstrip('/')}/api/embeddings"
 
 
 def _post_ollama(url: str, payload: dict) -> dict:
@@ -75,9 +70,8 @@ def embed_texts(
             texts,
             model=chosen_model,
             max_workers=max_workers,
-            expected_dim=EXPECTED_EMBED_DIM,
+            expected_dim=expected_dim,
         )
-
     url = _ollama_embeddings_url()
     vectors: List[List[float]] = []
     for text in texts:
