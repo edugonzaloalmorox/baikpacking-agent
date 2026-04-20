@@ -10,11 +10,23 @@ services:
       - "5433:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
+      - ./backups:/backups
+      - ./docker/init:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U baikpacking -d baikpacking"]
       interval: 5s
       timeout: 5s
       retries: 20
 
+  ollama:
+    image: ollama/ollama:latest
+    container_name: baikpacking-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
 volumes:
   pg_data:
+  ollama_data:
+
