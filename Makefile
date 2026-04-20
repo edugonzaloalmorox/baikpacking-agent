@@ -14,7 +14,8 @@ PG_PORT ?= 5433
 PG_CONTAINER ?= baikpacking-postgres
 PG_USER ?= baikpacking
 PG_DB ?= baikpacking
-PG_VOLUME ?= pg_data
+PG_BACKUP ?= backups/baikpacking.dump
+
 
 API_PORT ?= 8001
 REFLEX_FRONTEND_PORT ?= 3000
@@ -36,7 +37,7 @@ CLEAN_SNAP_GLOB := dotwatcher_bikes_cleaned_new_*.json
 	help \
 	check-env \
 	docker-check docker-up \
-	pg-up pg-check pg-reset \
+	pg-up pg-check pg-reset pg-restore pg-bootstrap pg-vector-check \
 	ollama-up ollama-check \
 	kb-scrape kb-clean kb-load kb-embed kb-update kb-check kb-backfill kb-load-file kb-status \
 	up dev \
@@ -56,7 +57,7 @@ help:
 	@echo "  make docker-up    start Docker Desktop if needed"
 	@echo "  make pg-up        start Postgres via docker compose"
 	@echo "  make pg-check     verify Postgres container and readiness"
-	@echo "  make pg-reset     destroy Postgres volume and reset DB"
+	@echo "  make pg-reset        remove Docker Compose DB volumes"
 	@echo ""
 	@echo "Ollama:"
 	@echo "  make ollama-up    start Ollama and pull embedding model"
@@ -83,6 +84,9 @@ help:
 	@echo "  make up           pg-up + ollama-up + kb-update"
 	@echo "  make dev          prepare infra and KB for development"
 	@echo ""
+	@echo "  make pg-vector-check verify pgvector extension"
+	@echo "  make pg-restore      restore DB from backup"
+	@echo "  make pg-bootstrap    rebuild Postgres from scratch and restore backup"
 
 # -------------------------
 # Environment checks
@@ -151,18 +155,56 @@ pg-check: docker-up
 		echo "👉 Run: make pg-up"; \
 		exit 1; \
 	fi
-	@docker exec -i $(PG_CONTAINER) pg_isready -U $(PG_USER) -d $(PG_DB) >/dev/null 2>&1 && \
-		echo "✅ Postgres responds to pg_isready" || \
-		( echo "❌ Postgres not ready"; exit 1 )
+	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT extname FROM pg_extension WHERE extname = 'vector';" | grep -q vector && \
+	echo "✅ pgvector extension is enabled" || \
+	( echo "❌ pgvector extension is NOT enabled"; exit 1 )
 	@echo ""
 
 pg-reset: docker-up
 	@echo ""
-	@echo "⚠️  [pg] RESET requested: this will DELETE the Postgres data volume."
-	@docker compose down --remove-orphans
-	@docker volume rm -f $(PG_VOLUME) >/dev/null 2>&1 || true
+	@echo "⚠️  [pg] RESET requested: this will DELETE Docker Compose volumes for the current project."
+	@docker compose down -v --remove-orphans
 	@echo "✅ [pg] Reset complete"
 	@echo "👉 Run: make pg-up"
+	@echo ""
+
+pg-vector-check: pg-up
+	@echo ""
+	@echo "🧩 [pg] Checking pgvector extension..."
+	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT extname FROM pg_extension WHERE extname = 'vector';"
+	@echo ""
+
+pg-restore: pg-up
+	@echo ""
+	@echo "📦 [pg] Restoring database from $(PG_BACKUP)..."
+	@if [[ ! -f "$(PG_BACKUP)" ]]; then \
+		echo "❌ Backup file not found: $(PG_BACKUP)"; \
+		exit 1; \
+	fi
+	@docker exec -i $(PG_CONTAINER) pg_restore -U $(PG_USER) -d $(PG_DB) /backups/$$(basename $(PG_BACKUP))
+	@echo "✅ [pg] Restore complete"
+	@echo ""
+
+
+pg-bootstrap: docker-up
+	@echo ""
+	@echo "🚧 [pg] Rebuilding Postgres from scratch and restoring backup..."
+	@if [[ ! -f "$(PG_BACKUP)" ]]; then \
+		echo "❌ Backup file not found: $(PG_BACKUP)"; \
+		exit 1; \
+	fi
+	@docker compose down -v --remove-orphans
+	@docker compose up -d postgres
+	@echo "⏳ [pg] Waiting for Postgres health/ready..."
+	@until docker exec -i $(PG_CONTAINER) pg_isready -U $(PG_USER) -d $(PG_DB) >/dev/null 2>&1; do \
+		sleep 2; \
+		echo "  ... waiting"; \
+	done
+	@echo "🧩 [pg] Verifying pgvector extension..."
+	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT extname FROM pg_extension WHERE extname = 'vector';"
+	@echo "📦 [pg] Restoring backup..."
+	@docker exec -i $(PG_CONTAINER) pg_restore -U $(PG_USER) -d $(PG_DB) /backups/$$(basename "$(PG_BACKUP)")
+	@echo "✅ [pg] Bootstrap complete"
 	@echo ""
 
 # -------------------------
@@ -294,12 +336,13 @@ kb-load-file:
 	@if [[ -z "$(FILE)" ]]; then echo "Usage: make kb-load-file FILE=path/to/snapshot.json"; exit 1; fi
 	$(UV) $(PY) -m baikpacking.db.data_loader --input "$(FILE)"
 
-kb-status:
+kb-status: pg-up
 	@echo ""
 	@echo "📊 [status] Checking database state..."
+	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT COUNT(*) AS total_articles FROM articles;" || true
 	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT COUNT(*) AS total_riders FROM riders;" || true
-	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT COUNT(*) AS total_embeddings FROM rider_embeddings;" || true
-	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT COUNT(*) AS riders_missing_embeddings FROM riders r LEFT JOIN rider_embeddings e ON r.id = e.rider_id WHERE e.rider_id IS NULL;" || true
+	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT COUNT(*) AS total_chunks FROM rider_chunks;" || true
+	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT COUNT(*) AS chunks_with_embeddings FROM rider_chunks WHERE embedding IS NOT NULL;" || true
 	@echo ""
 
 # -------------------------
