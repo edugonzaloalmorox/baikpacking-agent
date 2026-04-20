@@ -53,6 +53,8 @@ monitoring/
 data/raw/
 data/tmp/
 data/cache/
+backups/*
+!backups/.gitkeep
 
 *.sqlite3
 *.db
