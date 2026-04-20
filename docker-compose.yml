@@ -33,6 +33,31 @@ services:
       retries: 10
     restart: unless-stopped
 
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    container_name: baikpacking-api
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://baikpacking:baikpacking@postgres:5432/baikpacking
+      EMB_OLLAMA_BASE_URL: http://ollama:11434
+      EMB_EMBEDDING_MODEL: mxbai-embed-large:335m
+    ports:
+      - "8001:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
 volumes:
   pg_data:
   ollama_data:
