@@ -15,11 +15,34 @@ This system turns that unstructured material into a searchable knowledge base an
 
 ![alt text](docs/front_page.png)
 
-## How the system is organised
+## Architecture
 
+bAIpacking is now partially dockerized:
 
-- The serving path ends at `Recommendation` and returns through the API
-- `Data Eval`, `human feedback`, and `LLM Judge` are evaluation artifacts, not part of the live request path
+- `postgres` container
+  - stores the knowledge base and embeddings in PostgreSQL with `pgvector`
+  - is initialized with `docker/init/01-enable-pgvector.sql`
+  - is restored from `backups/baikpacking.dump` during bootstrap
+- `ollama` container
+  - serves embedding inference
+  - persists pulled models in a Docker volume mounted at `/root/.ollama`
+- `api` container
+  - serves the FastAPI application
+  - talks to Postgres at `postgres:5432`
+  - talks to Ollama at `http://ollama:11434`
+- Reflex UI
+  - runs locally for now
+  - talks to the API on `http://localhost:8001`
+
+Exposed host ports:
+
+- `localhost:5433` for Postgres
+- `localhost:11434` for Ollama
+- `localhost:8001` for the API
+- `localhost:3000` for the Reflex frontend
+- `localhost:8000` for the Reflex backend
+
+The serving path ends at `Recommendation` and returns through the API. `Data Eval`, `human feedback`, and `LLM Judge` are evaluation artifacts, not part of the live request path.
 
 ![alt text](docs/architecture.png)
 
@@ -138,7 +161,15 @@ Important directories and entrypoints:
 - `archive/`
   - legacy code and older evaluation artifacts kept for reference
 
-## Setup And Reproducibility
+## Local Setup
+
+### Prerequisites
+
+- Docker Desktop or another Docker Engine that can run Docker Compose
+- `uv`
+- a local `backups/baikpacking.dump` file
+
+If Docker is not running, `make docker-check` will fail and `make docker-up` can start Docker Desktop on macOS.
 
 ### 1. Install Dependencies
 
@@ -152,38 +183,102 @@ Create or edit `.env` with local values. Common variables include:
 
 - `DATABASE_URL`
 - `EMB_EMBEDDING_MODEL`
+- `EMB_OLLAMA_BASE_URL`
 - `OLLAMA_HOST`
 - `LOGFIRE_TOKEN`
+- `OPENAI_API_KEY`
 
-### 3. Bootstrap Local Services
+For local host commands, use values like:
+
+- `DATABASE_URL=postgresql://baikpacking:baikpacking@localhost:5433/baikpacking`
+- `EMB_EMBEDDING_MODEL=mxbai-embed-large:335m`
+- `EMB_OLLAMA_BASE_URL=http://localhost:11434`
+
+Inside Docker, the API container gets the service-network values from `docker-compose.yml`:
+
+- `DATABASE_URL=postgresql://baikpacking:baikpacking@postgres:5432/baikpacking`
+- `EMB_OLLAMA_BASE_URL=http://ollama:11434`
+- `EMB_EMBEDDING_MODEL=mxbai-embed-large:335m`
+
+### 3. Put The Postgres Backup In Place
+
+The backup file should exist at `backups/baikpacking.dump`.
+
+- the `backups/` directory is tracked with `backups/.gitkeep`
+- the dump file itself does not need to be committed
+- `make pg-bootstrap` and `make pg-restore` both expect the dump to be present locally
+
+### 4. Bootstrap Postgres
+
+For an existing Postgres volume, start the container with:
 
 ```bash
 make pg-up
-make ollama-up
 ```
 
-If you want a full Postgres bootstrap from scratch, use:
+For a fresh machine or a full reset, use:
 
 ```bash
 make pg-bootstrap
 ```
 
-This removes the current Docker Compose volumes for the project, recreates Postgres, verifies `pgvector`, and restores the database backup from `backups/baikpacking.dump.`
+`make pg-bootstrap` removes the current Docker Compose volumes for the project, recreates Postgres, waits for readiness, verifies `pgvector`, and restores the database backup from `backups/baikpacking.dump`.
 
-Ollama needs an embedding model before the embedding pipeline can run. Set the model in your environment, then pull it into the Dockerized Ollama container:
+`pgvector` is enabled automatically during first initialization by the SQL script mounted at `/docker-entrypoint-initdb.d/01-enable-pgvector.sql`.
+
+Useful Postgres targets:
+
+- `make pg-up` starts the existing Postgres container and waits for readiness
+- `make pg-check` checks the running container, `pg_isready`, and `pgvector`
+- `make pg-reset` removes the Docker Compose DB volumes
+- `make pg-restore` restores the local backup into an already running database
+- `make pg-vector-check` prints the `vector` extension state
+
+### 5. Bootstrap Ollama
 
 ```bash
-export EMB_EMBEDDING_MODEL=mxbai-embed-large:335m
+make ollama-up
 make ollama-pull
 ```
 
-For a one-shot local bootstrap, use:
+`make ollama-up` starts the Dockerized Ollama service and keeps models in the persistent `/root/.ollama` volume.
+
+`make ollama-pull` pulls `$(EMB_EMBEDDING_MODEL)` into that container. Set `EMB_EMBEDDING_MODEL` in `.env` before running it.
+
+### 6. Start The API In Docker
+
+The API is defined in `docker-compose.yml` and runs in Docker.
+
+This checkout does not define a `make api-up` helper, so use Docker Compose directly for the containerized API.
 
 ```bash
-make dev
+docker compose up -d api
 ```
 
-This starts Postgres, starts Ollama, pulls the embedding model, updates the KB, and prints the DB status.
+Use `docker compose ps api` and `docker compose logs -f api` to inspect it. The API container uses the Docker-network values for Postgres and Ollama listed above.
+
+### 7. Run The Reflex UI Locally
+
+```bash
+make ui
+```
+
+This runs Reflex locally and points it at `http://localhost:8001`.
+
+### Recommended Bootstrap Path
+
+For a fresh machine, use this order:
+
+1. configure `.env`
+2. make sure `backups/baikpacking.dump` exists locally
+3. run `make pg-bootstrap`
+4. run `make ollama-up`
+5. run `make ollama-pull`
+6. run `docker compose up -d api`
+7. run `make kb-update` if you need to rebuild the knowledge base
+8. run `make ui`
+
+`make up` is a shorter infra bootstrap: it starts Postgres, starts Ollama, pulls the model, and refreshes the KB. `make dev` does the same and then prints the DB status.
 
 ## Run The KB Pipeline
 
@@ -216,30 +311,28 @@ This prints:
 
 It also appends a small runtime eval row to `data/eval/sample_eval_rows.jsonl`.
 
-## HTTP API
+## API
 
-The repository now includes a small FastAPI wrapper around the existing
-recommendation pipeline.
+The FastAPI service can be run either locally or in Docker.
 
 Run it locally:
 
 ```bash
-uv run uvicorn baikpacking.api.main:app --host 0.0.0.0 --port 8000
+make api
 ```
 
-Run it in Docker:
+Run the Dockerized service:
 
 ```bash
-docker build -t baikpacking-api .
-docker run --rm -p 8000:8000 --env-file .env baikpacking-api
+docker compose up -d api
 ```
 
 Quick curl examples:
 
 ```bash
-curl http://localhost:8000/health
-curl http://localhost:8000/ready
-curl -X POST http://localhost:8000/recommend \
+curl http://localhost:8001/health
+curl http://localhost:8001/ready
+curl -X POST http://localhost:8001/recommend \
   -H 'Content-Type: application/json' \
   -d '{"query":"What tyres should I use for Atlas Mountain Race?","include_debug":true}'
 ```
@@ -249,6 +342,23 @@ recommendation, evidence, policy, and optional debug trace data.
 `GET /health` is a liveness check; `GET /ready` verifies database connectivity.
 Each live `/recommend` request also appends a deterministic live-eval row to
 `data/eval/live_runs.jsonl`.
+
+## Bootstrap Targets
+
+The main Makefile targets are:
+
+- `make docker-check` checks that Docker is available
+- `make docker-up` starts Docker Desktop if needed
+- `make pg-up` starts an existing Postgres container
+- `make pg-bootstrap` recreates Postgres from scratch and restores the backup
+- `make ollama-up` starts Dockerized Ollama with persistent model storage
+- `make ollama-pull` pulls the embedding model into Ollama
+- `make api` runs the FastAPI app locally on `localhost:8001`
+- `make ui` runs the Reflex UI locally
+- `make up` boots Postgres, Ollama, the model, and the KB refresh
+- `make dev` runs `make up` and then prints database status
+- `make app` runs the local API and Reflex UI together
+- `make stop-app` stops the local API/UI ports
 
 ## Reflex UI
 
