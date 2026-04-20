@@ -155,20 +155,35 @@ Create or edit `.env` with local values. Common variables include:
 - `OLLAMA_HOST`
 - `LOGFIRE_TOKEN`
 
-### 3. Start Local Services
+### 3. Bootstrap Local Services
 
 ```bash
 make pg-up
 make ollama-up
 ```
 
-If needed, set the embedding model before starting Ollama:
+If you want a full Postgres bootstrap from scratch, use:
+
+```bash
+make pg-bootstrap
+```
+
+This removes the current Docker Compose volumes for the project, recreates Postgres, verifies `pgvector`, and restores the database backup from `backups/baikpacking.dump.`
+
+Ollama needs an embedding model before the embedding pipeline can run. Set the model in your environment, then pull it into the Dockerized Ollama container:
 
 ```bash
 export EMB_EMBEDDING_MODEL=mxbai-embed-large:335m
+make ollama-pull
 ```
 
-For a one-shot local bootstrap, `make dev` is available.
+For a one-shot local bootstrap, use:
+
+```bash
+make dev
+```
+
+This starts Postgres, starts Ollama, pulls the embedding model, updates the KB, and prints the DB status.
 
 ## Run The KB Pipeline
 

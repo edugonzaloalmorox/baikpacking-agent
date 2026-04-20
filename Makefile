@@ -17,6 +17,11 @@ PG_DB ?= baikpacking
 PG_BACKUP ?= backups/baikpacking.dump
 
 
+OLLAMA_CONTAINER ?= baikpacking-ollama
+OLLAMA_MODEL ?= $(EMB_EMBEDDING_MODEL)
+OLLAMA_PORT ?= 11434
+
+
 API_PORT ?= 8001
 REFLEX_FRONTEND_PORT ?= 3000
 REFLEX_BACKEND_PORT ?= 8000
@@ -38,7 +43,7 @@ CLEAN_SNAP_GLOB := dotwatcher_bikes_cleaned_new_*.json
 	check-env \
 	docker-check docker-up \
 	pg-up pg-check pg-reset pg-restore pg-bootstrap pg-vector-check \
-	ollama-up ollama-check \
+    ollama-up ollama-check ollama-pull \
 	kb-scrape kb-clean kb-load kb-embed kb-update kb-check kb-backfill kb-load-file kb-status \
 	up dev \
 	api ui app stop-app stop-ports
@@ -60,8 +65,9 @@ help:
 	@echo "  make pg-reset        remove Docker Compose DB volumes"
 	@echo ""
 	@echo "Ollama:"
-	@echo "  make ollama-up    start Ollama and pull embedding model"
-	@echo "  make ollama-check verify Ollama status"
+	@echo "  make ollama-up    start Dockerized Ollama"
+	@echo "  make ollama-check verify Dockerized Ollama status"
+	@echo "  make ollama-pull  pull embedding model into Dockerized Ollama"
 	@echo ""
 	@echo "Knowledge base:"
 	@echo "  make kb-scrape    run incremental scraper"
@@ -155,9 +161,12 @@ pg-check: docker-up
 		echo "👉 Run: make pg-up"; \
 		exit 1; \
 	fi
+	@docker exec -i $(PG_CONTAINER) pg_isready -U $(PG_USER) -d $(PG_DB) >/dev/null 2>&1 && \
+		echo "✅ Postgres responds to pg_isready" || \
+		( echo "❌ Postgres not ready"; exit 1 )
 	@docker exec -i $(PG_CONTAINER) psql -U $(PG_USER) -d $(PG_DB) -c "SELECT extname FROM pg_extension WHERE extname = 'vector';" | grep -q vector && \
-	echo "✅ pgvector extension is enabled" || \
-	( echo "❌ pgvector extension is NOT enabled"; exit 1 )
+		echo "✅ pgvector extension is enabled" || \
+		( echo "❌ pgvector extension is NOT enabled"; exit 1 )
 	@echo ""
 
 pg-reset: docker-up
@@ -207,74 +216,50 @@ pg-bootstrap: docker-up
 	@echo "✅ [pg] Bootstrap complete"
 	@echo ""
 
+
 # -------------------------
-# Ollama
+# Ollama (in the Docker container)
 # -------------------------
 
-ollama-up:
+ollama-up: docker-up
 	@echo ""
-	@echo "🔌 [ollama] Checking Ollama availability..."
-	@if ! command -v ollama >/dev/null 2>&1; then \
-		echo "❌ Ollama is not installed or not in PATH."; \
-		echo "👉 Install from https://ollama.com"; \
-		exit 1; \
-	fi
-	@echo "✅ Ollama binary found"
-
-	@echo ""
-	@echo "🚀 [ollama] Starting Ollama server (ollama serve)..."
-	@if pgrep -f "ollama serve" >/dev/null 2>&1; then \
-		echo "✅ Ollama server already running"; \
-	else \
-		echo "➡️  Ollama not running, starting server..."; \
-		ollama serve >/tmp/ollama.log 2>&1 & \
+	@echo "🦙 [ollama] Starting Dockerized Ollama..."
+	@docker compose up -d ollama
+	@echo "⏳ [ollama] Waiting for container to respond..."
+	@until docker exec -i $(OLLAMA_CONTAINER) ollama list >/dev/null 2>&1; do \
 		sleep 2; \
-	fi
-
+		echo "  ... waiting"; \
+	done
+	@echo "✅ [ollama] Dockerized Ollama is ready"
 	@echo ""
-	@echo "🔍 [ollama] Verifying server responds on http://localhost:11434 ..."
-	@if command -v curl >/dev/null 2>&1; then \
-		if ! curl -sf http://localhost:11434 >/dev/null 2>&1; then \
-			echo "❌ Ollama server did not respond on localhost:11434"; \
-			echo "👉 Check logs: /tmp/ollama.log"; \
-			exit 1; \
-		fi; \
+
+ollama-check: docker-up
+	@echo ""
+	@echo "🦙 [ollama] Checking Dockerized Ollama..."
+	@if docker ps --format '{{.Names}}' | grep -q '^$(OLLAMA_CONTAINER)$$'; then \
+		echo "✅ Container running: $(OLLAMA_CONTAINER)"; \
 	else \
-		echo "⚠️ curl not found; skipping HTTP check (install curl for stronger checks)"; \
-	fi
-	@echo "✅ Ollama server is responding"
-
-	@echo ""
-	@echo "📦 [ollama] Pulling embedding model: $$EMB_EMBEDDING_MODEL"
-	@if [[ -z "$$EMB_EMBEDDING_MODEL" ]]; then \
-		echo "❌ EMB_EMBEDDING_MODEL is not set in environment"; \
-		echo "👉 export EMB_EMBEDDING_MODEL=mxbai-embed-large:335m"; \
+		echo "❌ Container NOT running: $(OLLAMA_CONTAINER)"; \
+		echo "👉 Run: make ollama-up"; \
 		exit 1; \
 	fi
-	@ollama pull $$EMB_EMBEDDING_MODEL
-	@echo "✅ Embedding model ready: $$EMB_EMBEDDING_MODEL"
-	@echo ""
-
-ollama-check:
-	@echo ""
-	@echo "🔍 [ollama] Status check"
-	@if ! command -v ollama >/dev/null 2>&1; then \
-		echo "❌ Ollama is not installed or not in PATH."; \
-		exit 1; \
-	fi
-	@pgrep -f "ollama serve" >/dev/null 2>&1 && \
-		echo "✅ Ollama server process is running" || \
-		echo "❌ Ollama server process is NOT running"
-
 	@if command -v curl >/dev/null 2>&1; then \
-		curl -sf http://localhost:11434 >/dev/null 2>&1 && \
-			echo "✅ Ollama responds on localhost:11434" || \
-			echo "❌ Ollama does NOT respond on localhost:11434"; \
+		curl -sf http://localhost:$(OLLAMA_PORT)/api/tags >/dev/null 2>&1 && \
+			echo "✅ Ollama responds on localhost:$(OLLAMA_PORT)" || \
+			( echo "❌ Ollama does NOT respond on localhost:$(OLLAMA_PORT)"; exit 1 ); \
 	fi
-
+	@docker exec -i $(OLLAMA_CONTAINER) ollama list
 	@echo ""
-	@echo "📦 Available models:"
-	@ollama list || true
+
+ollama-pull: ollama-up
+	@echo ""
+	@echo "📦 [ollama] Pulling model into Dockerized Ollama..."
+	@if [[ -z "$(OLLAMA_MODEL)" ]]; then \
+		echo "❌ OLLAMA_MODEL / EMB_EMBEDDING_MODEL is not set"; \
+		exit 1; \
+	fi
+	@docker exec -i $(OLLAMA_CONTAINER) ollama pull $(OLLAMA_MODEL)
+	@echo "✅ [ollama] Model ready in container: $(OLLAMA_MODEL)"
 	@echo ""
 
 # -------------------------
@@ -349,13 +334,14 @@ kb-status: pg-up
 # Bootstrap
 # -------------------------
 
-up: pg-up ollama-up kb-update
+up: pg-up ollama-up ollama-pull kb-update
 
 dev:
 	@echo ""
 	@echo "🚀 Starting development environment..."
 	@$(MAKE) pg-up
 	@$(MAKE) ollama-up
+	@$(MAKE) ollama-pull
 	@$(MAKE) kb-update
 	@$(MAKE) kb-status
 	@echo ""
