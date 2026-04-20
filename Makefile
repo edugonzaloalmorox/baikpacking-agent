@@ -16,16 +16,21 @@ PG_USER ?= baikpacking
 PG_DB ?= baikpacking
 PG_BACKUP ?= backups/baikpacking.dump
 
-
 OLLAMA_CONTAINER ?= baikpacking-ollama
 OLLAMA_MODEL ?= $(EMB_EMBEDDING_MODEL)
 OLLAMA_PORT ?= 11434
 
-
 API_PORT ?= 8001
+API_CONTAINER ?= baikpacking-api
+API_HEALTH_URL ?= http://localhost:$(API_PORT)/health
+API_READY_URL ?= http://localhost:$(API_PORT)/ready
+
 REFLEX_FRONTEND_PORT ?= 3000
 REFLEX_BACKEND_PORT ?= 8000
 API_BASE_URL ?= http://127.0.0.1:$(API_PORT)
+
+UI_CONTAINER ?= baikpacking-ui
+UI_URL ?= http://localhost:3000
 
 DATA_DIR := data
 SNAP_RAW_DIR := $(DATA_DIR)/snapshots/raw
@@ -43,7 +48,8 @@ CLEAN_SNAP_GLOB := dotwatcher_bikes_cleaned_new_*.json
 	check-env \
 	docker-check docker-up \
 	pg-up pg-check pg-reset pg-restore pg-bootstrap pg-vector-check \
-    ollama-up ollama-check ollama-pull \
+	ollama-up ollama-check ollama-pull \
+	api-up api-check api-logs api-rebuild api-down \
 	kb-scrape kb-clean kb-load kb-embed kb-update kb-check kb-backfill kb-load-file kb-status \
 	up dev \
 	api ui app stop-app stop-ports
@@ -55,44 +61,53 @@ CLEAN_SNAP_GLOB := dotwatcher_bikes_cleaned_new_*.json
 help:
 	@echo ""
 	@echo "Environment:"
-	@echo "  make check-env   validate OPENAI_API_KEY formatting"
+	@echo "  make check-env       validate OPENAI_API_KEY formatting"
 	@echo ""
-	@echo "Docker / Postgres:"
-	@echo "  make docker-check check Docker daemon"
-	@echo "  make docker-up    start Docker Desktop if needed"
-	@echo "  make pg-up        start Postgres via docker compose"
-	@echo "  make pg-check     verify Postgres container and readiness"
-	@echo "  make pg-reset        remove Docker Compose DB volumes"
+	@echo "Docker:"
+	@echo "  make docker-check    check Docker daemon"
+	@echo "  make docker-up       start Docker Desktop if needed"
 	@echo ""
-	@echo "Ollama:"
-	@echo "  make ollama-up    start Dockerized Ollama"
-	@echo "  make ollama-check verify Dockerized Ollama status"
-	@echo "  make ollama-pull  pull embedding model into Dockerized Ollama"
-	@echo ""
-	@echo "Knowledge base:"
-	@echo "  make kb-scrape    run incremental scraper"
-	@echo "  make kb-clean     clean latest raw snapshot"
-	@echo "  make kb-load      load latest cleaned snapshot into DB"
-	@echo "  make kb-embed     generate embeddings"
-	@echo "  make kb-update    scrape -> clean -> load -> embed"
-	@echo "  make kb-check     show latest snapshot files"
-	@echo "  make kb-backfill  load full cleaned dataset"
-	@echo "  make kb-load-file FILE=path/to/file.json"
-	@echo "  make kb-status    inspect DB counts"
-	@echo ""
-	@echo "App:"
-	@echo "  make api          run FastAPI backend on port $(API_PORT)"
-	@echo "  make ui           run Reflex frontend"
-	@echo "  make app          run FastAPI + Reflex together"
-	@echo "  make stop-app     stop ports $(REFLEX_FRONTEND_PORT), $(REFLEX_BACKEND_PORT), $(API_PORT)"
-	@echo ""
-	@echo "Bootstrap:"
-	@echo "  make up           pg-up + ollama-up + kb-update"
-	@echo "  make dev          prepare infra and KB for development"
-	@echo ""
+	@echo "Postgres:"
+	@echo "  make pg-up           start Postgres via docker compose"
+	@echo "  make pg-check        verify Postgres container, readiness, and pgvector"
 	@echo "  make pg-vector-check verify pgvector extension"
 	@echo "  make pg-restore      restore DB from backup"
 	@echo "  make pg-bootstrap    rebuild Postgres from scratch and restore backup"
+	@echo "  make pg-reset        remove Docker Compose DB volumes"
+	@echo ""
+	@echo "Ollama:"
+	@echo "  make ollama-up       start Dockerized Ollama"
+	@echo "  make ollama-check    verify Dockerized Ollama status"
+	@echo "  make ollama-pull     pull embedding model into Dockerized Ollama"
+	@echo ""
+	@echo "Docker API:"
+	@echo "  make api-up          start Dockerized FastAPI"
+	@echo "  make api-check       verify Dockerized FastAPI health/readiness"
+	@echo "  make api-logs        tail Dockerized FastAPI logs"
+	@echo "  make api-rebuild     rebuild and restart Dockerized FastAPI"
+	@echo "  make api-down        stop Dockerized FastAPI"
+	@echo ""
+	@echo "Knowledge base:"
+	@echo "  make kb-scrape       run incremental scraper"
+	@echo "  make kb-clean        clean latest raw snapshot"
+	@echo "  make kb-load         load latest cleaned snapshot into DB"
+	@echo "  make kb-embed        generate embeddings"
+	@echo "  make kb-update       scrape -> clean -> load -> embed"
+	@echo "  make kb-check        show latest snapshot files"
+	@echo "  make kb-backfill     load full cleaned dataset"
+	@echo "  make kb-load-file FILE=path/to/file.json"
+	@echo "  make kb-status       inspect DB counts"
+	@echo ""
+	@echo "Local app:"
+	@echo "  make api             run FastAPI backend on port $(API_PORT)"
+	@echo "  make ui              run Reflex frontend"
+	@echo "  make app             run FastAPI + Reflex together"
+	@echo "  make stop-app        stop ports $(REFLEX_FRONTEND_PORT), $(REFLEX_BACKEND_PORT), $(API_PORT)"
+	@echo ""
+	@echo "Bootstrap:"
+	@echo "  make up              pg-up + ollama-up + ollama-pull + kb-update"
+	@echo "  make dev             prepare infra, model, and KB for development"
+	@echo ""
 
 # -------------------------
 # Environment checks
@@ -194,7 +209,6 @@ pg-restore: pg-up
 	@echo "✅ [pg] Restore complete"
 	@echo ""
 
-
 pg-bootstrap: docker-up
 	@echo ""
 	@echo "🚧 [pg] Rebuilding Postgres from scratch and restoring backup..."
@@ -216,9 +230,8 @@ pg-bootstrap: docker-up
 	@echo "✅ [pg] Bootstrap complete"
 	@echo ""
 
-
 # -------------------------
-# Ollama (in the Docker container)
+# Ollama (Docker)
 # -------------------------
 
 ollama-up: docker-up
@@ -260,6 +273,124 @@ ollama-pull: ollama-up
 	fi
 	@docker exec -i $(OLLAMA_CONTAINER) ollama pull $(OLLAMA_MODEL)
 	@echo "✅ [ollama] Model ready in container: $(OLLAMA_MODEL)"
+	@echo ""
+
+# -------------------------
+# API (Docker)
+# -------------------------
+
+api-up: docker-up
+	@echo ""
+	@echo "⚡ [api] Starting Dockerized FastAPI..."
+	@docker compose up -d api
+	@echo "⏳ [api] Waiting for health endpoint..."
+	@until curl -sf $(API_HEALTH_URL) >/dev/null 2>&1; do \
+		sleep 2; \
+		echo "  ... waiting"; \
+	done
+	@echo "✅ [api] Dockerized FastAPI is responding on $(API_HEALTH_URL)"
+	@echo ""
+
+api-check: docker-up
+	@echo ""
+	@echo "⚡ [api] Checking Dockerized FastAPI..."
+	@if docker ps --format '{{.Names}}' | grep -q '^$(API_CONTAINER)$$'; then \
+		echo "✅ Container running: $(API_CONTAINER)"; \
+	else \
+		echo "❌ Container NOT running: $(API_CONTAINER)"; \
+		echo "👉 Run: make api-up"; \
+		exit 1; \
+	fi
+	@if command -v curl >/dev/null 2>&1; then \
+		curl -sf $(API_HEALTH_URL) >/dev/null 2>&1 && \
+			echo "✅ Health endpoint responds: $(API_HEALTH_URL)" || \
+			( echo "❌ Health endpoint failed: $(API_HEALTH_URL)"; exit 1 ); \
+		curl -sf $(API_READY_URL) >/dev/null 2>&1 && \
+			echo "✅ Ready endpoint responds: $(API_READY_URL)" || \
+			( echo "❌ Ready endpoint failed: $(API_READY_URL)"; exit 1 ); \
+	fi
+	@echo ""
+
+api-logs: docker-up
+	@echo ""
+	@echo "📜 [api] Tailing Dockerized FastAPI logs..."
+	@docker logs -f $(API_CONTAINER)
+
+api-rebuild: docker-up
+	@echo ""
+	@echo "🔁 [api] Rebuilding Dockerized FastAPI..."
+	@docker compose up --build -d api
+	@echo "⏳ [api] Waiting for health endpoint..."
+	@until curl -sf $(API_HEALTH_URL) >/dev/null 2>&1; do \
+		sleep 2; \
+		echo "  ... waiting"; \
+	done
+	@echo "✅ [api] Dockerized FastAPI rebuilt and healthy"
+	@echo ""
+
+api-down: docker-up
+	@echo ""
+	@echo "🛑 [api] Stopping Dockerized FastAPI..."
+	@docker compose stop api
+	@echo "✅ [api] Dockerized FastAPI stopped"
+	@echo ""
+
+# -------------------------
+# UI (Docker)
+# -------------------------
+
+
+ui-up: docker-up
+	@echo ""
+	@echo "🎨 [ui] Starting Dockerized Reflex UI..."
+	@docker compose up -d ui
+	@echo "⏳ [ui] Waiting for UI to respond..."
+	@until curl -sf $(UI_URL) >/dev/null 2>&1; do \
+		sleep 2; \
+		echo "  ... waiting"; \
+	done
+	@echo "✅ [ui] Dockerized UI is responding on $(UI_URL)"
+	@echo ""
+
+ui-check: docker-up
+	@echo ""
+	@echo "🎨 [ui] Checking Dockerized Reflex UI..."
+	@if docker ps --format '{{.Names}}' | grep -q '^$(UI_CONTAINER)$$'; then \
+		echo "✅ Container running: $(UI_CONTAINER)"; \
+	else \
+		echo "❌ Container NOT running: $(UI_CONTAINER)"; \
+		echo "👉 Run: make ui-up"; \
+		exit 1; \
+	fi
+	@if command -v curl >/dev/null 2>&1; then \
+		curl -sf $(UI_URL) >/dev/null 2>&1 && \
+			echo "✅ UI responds on $(UI_URL)" || \
+			( echo "❌ UI does NOT respond on $(UI_URL)"; exit 1 ); \
+	fi
+	@echo ""
+
+ui-logs: docker-up
+	@echo ""
+	@echo "📜 [ui] Tailing Dockerized Reflex UI logs..."
+	@docker logs -f $(UI_CONTAINER)
+
+ui-rebuild: docker-up
+	@echo ""
+	@echo "🔁 [ui] Rebuilding Dockerized Reflex UI..."
+	@docker compose up --build -d ui
+	@echo "⏳ [ui] Waiting for UI to respond..."
+	@until curl -sf $(UI_URL) >/dev/null 2>&1; do \
+		sleep 2; \
+		echo "  ... waiting"; \
+	done
+	@echo "✅ [ui] Dockerized UI rebuilt and responding on $(UI_URL)"
+	@echo ""
+
+ui-down: docker-up
+	@echo ""
+	@echo "🛑 [ui] Stopping Dockerized Reflex UI..."
+	@docker compose stop ui
+	@echo "✅ [ui] Dockerized UI stopped"
 	@echo ""
 
 # -------------------------
@@ -349,7 +480,7 @@ dev:
 	@echo ""
 
 # -------------------------
-# App
+# Local app
 # -------------------------
 
 api:
@@ -386,7 +517,3 @@ stop-app:
 	@echo ""
 
 stop-ports: stop-app
-
-
-
-
