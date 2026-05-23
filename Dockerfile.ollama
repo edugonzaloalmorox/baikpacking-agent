@@ -1,0 +1,19 @@
+FROM ollama/ollama:latest
+
+ENV OLLAMA_MODEL=mxbai-embed-large:335m
+ENV OLLAMA_MODELS=/opt/ollama-models
+ENV OLLAMA_HOST=0.0.0.0:11434
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/build-ollama-model.sh /tmp/build-ollama-model.sh
+
+RUN mkdir -p /opt/ollama-models \
+    && chmod +x /tmp/build-ollama-model.sh \
+    && /tmp/build-ollama-model.sh
+
+EXPOSE 11434
+
+CMD ["serve"]
