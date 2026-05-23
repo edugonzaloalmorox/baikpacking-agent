@@ -2,7 +2,7 @@
 import json
 import threading
 from queue import Queue
-from anyio import to_thread
+import anyio
 
 
 from fastapi import APIRouter, Depends, Request
@@ -89,31 +89,46 @@ async def recommend_stream(
     sentinel = object()
 
     def _emit_progress(progress) -> None:
-        queue.put(
-            RecommendationStreamEvent(
-                kind="progress",
-                progress=progress,
-            ).model_dump(mode="json")
-        )
+        if hasattr(progress, "model_dump"):
+            progress_payload = progress.model_dump(mode="json")
+        else:
+            progress_payload = progress
+
+        queue.put({
+            "kind": "progress",
+            "progress": progress_payload,
+        })
 
     def _worker() -> None:
         try:
-            response = service.recommend_sync(request, request_meta=request_meta, progress_callback=_emit_progress)
-            queue.put(
-                RecommendationStreamEvent(
-                    kind="final",
-                    response=response.model_dump(mode="json"),
-                ).model_dump(mode="json")
+            queue.put({
+                "kind": "progress",
+                "progress": {
+                    "stage_key": "started",
+                    "stage_label": "Starting recommendation",
+                    "details": {},
+                },
+            })
+
+            response = service.recommend_sync(
+                request,
+                request_meta=request_meta,
+                progress_callback=_emit_progress,
             )
+
+            queue.put({
+                "kind": "final",
+                "response": response.model_dump(mode="json"),
+            })
+
         except Exception as exc:
             status_code = getattr(exc, "status_code", 500)
-            queue.put(
-                RecommendationStreamEvent(
-                    kind="error",
-                    error=str(exc),
-                    status_code=status_code,
-                ).model_dump(mode="json")
-            )
+            queue.put({
+                "kind": "error",
+                "error": str(exc),
+                "status_code": status_code,
+            })
+
         finally:
             queue.put(sentinel)
 

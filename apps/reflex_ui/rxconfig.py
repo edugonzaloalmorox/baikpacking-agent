@@ -27,6 +27,6 @@ if str(SRC) not in sys.path:
 config = rx.Config(
     app_name="reflex_ui",
     frontend_port=3000,
-    backend_port=8000,
-    api_url=os.getenv("REFLEX_API_URL", "http://localhost:8000"),
+    backend_port=3000,
+    api_url=os.getenv("REFLEX_API_URL", "http://localhost:3000"),
 )
