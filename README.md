@@ -1,6 +1,6 @@
 # 🚵‍♂️ bAIpacking Agent
 
-Capstone project for the [AI Engineering Buildcamp: From RAG to Agents](https://maven.com/alexey-grigorev/from-rag-to-agents)
+Capstone project for the [AI Engineering Buildcamp: From RAG to Agents](https://maven.com/alexey-grigorev/from-rag-to-agents). The service is provided on [https://bikepackscout.fyi](https://bikepackscout.fyi/)
 
 ## The problem
 
@@ -32,6 +32,20 @@ bAIpacking is Docker-first and orchestrated with `docker compose`:
 - `baikpacking-ui`
   - Reflex UI
   - connects internally to `http://api:8000`
+
+For the production-like deployment, the local Docker Compose architecture is translated to Google Cloud services as follows:
+
+- `baikpacking-ui` -> Cloud Run
+- `baikpacking-backend` -> Cloud Run
+- `baikpacking-ollama` -> Cloud Run
+- PostgreSQL + `pgvector` -> Cloud SQL PostgreSQL
+- Docker images -> Artifact Registry
+- secrets -> Secret Manager
+- custom domain -> Cloud Run domain mapping
+
+PostgreSQL should not be deployed as a normal Cloud Run container in this setup. For a production-like deployment, it should run as Cloud SQL PostgreSQL instead.
+
+Most services are deployed in `europe-southwest1`, but the UI is deployed in `europe-west1` because direct Cloud Run domain mappings are not available in `europe-southwest1`.
 
 Exposed host ports:
 
@@ -476,6 +490,7 @@ If `LOGFIRE_TOKEN` is configured, inspect traces in Logfire. Otherwise tracing r
 
 ## Want to review the system? 
 
+- Check [https://bikepackscout.fyi](https://bikepackscout.fyi)
 - Run the recommender: `uv run python -m baikpacking.scripts.run_recommender`
 - Run eval: `uv run python -m baikpacking.scripts.run_eval_scenarios`
 - Open the dashboard: `uv run streamlit run src/baikpacking/apps/eval_dashboard.py`
